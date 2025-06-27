@@ -5,3 +5,4 @@ chromadb
 tiktoken
 whisper
 elevenlabs
+langchain-openai
