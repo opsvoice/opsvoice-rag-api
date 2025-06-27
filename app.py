@@ -1,12 +1,11 @@
 from flask import Flask, request, jsonify
-from langchain_community.vectorstores import Chroma
-from langchain_openai import ChatOpenAI
+from langchain.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA
 import whisper
 import requests
+import os
 
 app = Flask(__name__)
 model = whisper.load_model("base")
