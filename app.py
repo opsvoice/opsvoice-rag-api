@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI
-from langchain_community.text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA
@@ -41,5 +41,7 @@ def voice_query():
     return jsonify({"answer": response["result"]})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 10000))  # Use the PORT env variable, default to 10000 locally
+    app.run(host="0.0.0.0", port=port)
+
 
