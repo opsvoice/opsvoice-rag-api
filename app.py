@@ -41,6 +41,6 @@ def voice_query():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))  # Use the PORT env variable, default to 10000 locally
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=port)
 
 
