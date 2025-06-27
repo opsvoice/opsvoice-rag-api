@@ -1,0 +1,7 @@
+Flask
+langchain
+openai
+chromadb
+tiktoken
+whisper
+elevenlabs
