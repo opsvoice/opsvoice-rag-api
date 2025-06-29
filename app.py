@@ -1,46 +1,51 @@
 from flask import Flask, request, jsonify
-from langchain.vectorstores import Chroma
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
-import whisper
-import requests
 import os
 
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "🚀 OpsVoice API is live!"
+# Load ChromaDB vectorstore (DO NOT re-embed here!)
+persist_directory = "./chroma_db"
+embedding = OpenAIEmbeddings()
+vectorstore = Chroma(
+    persist_directory=persist_directory,
+    embedding_function=embedding,
+)
+retriever = vectorstore.as_retriever()
+qa_chain = RetrievalQA.from_chain_type(
+    llm=ChatOpenAI(temperature=0),
+    chain_type="stuff",
+    retriever=retriever
+)
 
-@app.route("/voice-query", methods=["POST"])
-def voice_query():
-    data = request.json
-    audio_url = data.get("audio_url")
+@app.route("/query", methods=["POST"])
+def query_sop():
+    data = request.get_json()
+    user_query = data.get("query")
+    if not user_query:
+        return jsonify({"error": "No query provided"}), 400
 
-    # 1. download audio
-    response = requests.get(audio_url)
-    with open("downloaded.wav", "wb") as f:
-        f.write(response.content)
-
-    # 2. load tiny model & transcribe (load inside endpoint to save RAM)
-    model = whisper.load_model("tiny")
-    result = model.transcribe("downloaded.wav")
-    query = result["text"]
-
-    # 3. load vectorstore
-    emb = OpenAIEmbeddings()
-    vectordb = Chroma(persist_directory="./chroma_db", embedding_function=emb)
-    retriever = vectordb.as_retriever()
-
-    # 4. RAG
-    qa = RetrievalQA.from_chain_type(llm=ChatOpenAI(temperature=0), retriever=retriever)
-    answer = qa.invoke({"query": query})
-
-    return jsonify({"answer": answer["result"]})
+    # Try to answer from SOPs
+    sop_answer = qa_chain.run(user_query)
+    # Fallback logic
+    if not sop_answer or "don't know" in sop_answer.lower() or "no information" in sop_answer.lower():
+        llm = ChatOpenAI(temperature=0)
+        prompt = f"The company SOPs do not cover this. Please provide a general business best practice for: {user_query}"
+        best_practice_answer = llm.invoke(prompt)
+        return jsonify({
+            "source": "general_best_practice",
+            "answer": best_practice_answer.content
+        })
+    else:
+        return jsonify({
+            "source": "sop",
+            "answer": sop_answer
+        })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Render sets PORT env variable
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
+
 
 
