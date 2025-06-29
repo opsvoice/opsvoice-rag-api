@@ -8,7 +8,6 @@ import requests
 import os
 
 app = Flask(__name__)
-model = whisper.load_model("base")
 
 @app.route("/")
 def home():
@@ -24,7 +23,8 @@ def voice_query():
     with open("downloaded.wav", "wb") as f:
         f.write(response.content)
 
-    # 2. transcribe
+    # 2. load tiny model & transcribe (load inside endpoint to save RAM)
+    model = whisper.load_model("tiny")
     result = model.transcribe("downloaded.wav")
     query = result["text"]
 
@@ -35,12 +35,12 @@ def voice_query():
 
     # 4. RAG
     qa = RetrievalQA.from_chain_type(llm=ChatOpenAI(temperature=0), retriever=retriever)
-    response = qa.invoke({"query": query})
+    answer = qa.invoke({"query": query})
 
-    return jsonify({"answer": response["result"]})
+    return jsonify({"answer": answer["result"]})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Use the PORT env variable, default to 10000 locally
+    port = int(os.environ.get("PORT", 10000))  # Render sets PORT env variable
     app.run(host="0.0.0.0", port=port)
 
 
