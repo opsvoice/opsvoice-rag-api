@@ -20,6 +20,10 @@ qa_chain = RetrievalQA.from_chain_type(
     retriever=retriever
 )
 
+@app.route("/")
+def home():
+    return "🚀 OpsVoice API is live!"
+
 @app.route("/query", methods=["POST"])
 def query_sop():
     data = request.get_json()
@@ -44,8 +48,11 @@ def query_sop():
             "answer": sop_answer
         })
 
+@app.route("/voice-query", methods=["POST"])
+def voice_query():
+    # Redirect /voice-query POST requests to the existing query_sop function
+    return query_sop()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
-
-
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
