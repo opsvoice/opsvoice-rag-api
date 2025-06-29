@@ -24,6 +24,13 @@ qa_chain = RetrievalQA.from_chain_type(
 def home():
     return "🚀 OpsVoice API is live!"
 
+@app.route("/list-sops", methods=["GET"])
+def list_sops():
+    import glob
+    files = glob.glob("sop-files/*.docx")
+    # You can also add more formats: "sop-files/*.pdf", etc.
+    return jsonify(files)
+
 @app.route("/query", methods=["POST"])
 def query_sop():
     data = request.get_json()
@@ -56,3 +63,4 @@ def voice_query():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
