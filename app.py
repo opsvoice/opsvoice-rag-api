@@ -22,7 +22,8 @@ persist_directory = get_persist_directory()
 UPLOAD_FOLDER = get_upload_folder()
 STATUS_FILE = os.path.join(UPLOAD_FOLDER, "status.json")
 
-app = Flask(__name__)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(persist_directory, exist_ok=True)
 
 # Load vectorstore ONCE at startup
 embedding = OpenAIEmbeddings()
@@ -37,6 +38,8 @@ qa_chain = RetrievalQA.from_chain_type(
     retriever=retriever
 )
 
+app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "🚀 OpsVoice API is live!"
@@ -45,6 +48,21 @@ def home():
 def list_sops():
     files = glob.glob(os.path.join(UPLOAD_FOLDER, "*.docx")) + glob.glob(os.path.join(UPLOAD_FOLDER, "*.pdf"))
     return jsonify(files)
+
+@app.route("/upload-sop", methods=["POST"])
+def upload_sop():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in request"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    ext = file.filename.split('.')[-1].lower()
+    if ext not in ['docx', 'pdf']:
+        return jsonify({"error": "File must be a .docx or .pdf"}), 400
+    save_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(save_path)
+    # You may want to trigger a background embedding task here
+    return jsonify({"message": f"File {file.filename} uploaded! It will be embedded and searchable soon."})
 
 @app.route("/query", methods=["POST"])
 def query_sop():
@@ -78,6 +96,7 @@ def sop_status():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
