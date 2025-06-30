@@ -1,10 +1,15 @@
 from flask import Flask, request, jsonify
 import os
 import json
+import glob
 
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
+from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+import pdfplumber
 
 # ----- Path Setup -----
 def get_persist_directory():
@@ -52,6 +57,31 @@ def get_status():
         print("Error reading status:", e)
         return {}
 
+# ----- Embedding logic for a single doc/pdf upload -----
+def embed_single_doc(file_path):
+    file_ext = file_path.split('.')[-1].lower()
+    docs = []
+
+    if file_ext == "docx":
+        loader = UnstructuredWordDocumentLoader(file_path)
+        docs = loader.load()
+    elif file_ext == "pdf":
+        with pdfplumber.open(file_path) as pdf:
+            text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+        if not text.strip():
+            raise ValueError("PDF appears to be empty or not extractable.")
+        # Wrap as LangChain Document type (minimal, for embedding)
+        docs = [{"page_content": text}]
+    else:
+        raise ValueError("Unsupported file type.")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    embeddings = OpenAIEmbeddings()
+    vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+    vectorstore.add_documents(chunks)
+    vectorstore.persist()
+
 # ----- Load ChromaDB vectorstore -----
 embedding = OpenAIEmbeddings()
 vectorstore = Chroma(
@@ -73,8 +103,7 @@ def home():
 
 @app.route("/list-sops", methods=["GET"])
 def list_sops():
-    import glob
-    files = glob.glob(os.path.join(UPLOAD_FOLDER, "*.docx"))
+    files = glob.glob(os.path.join(UPLOAD_FOLDER, "*.docx")) + glob.glob(os.path.join(UPLOAD_FOLDER, "*.pdf"))
     return jsonify(files)
 
 @app.route("/query", methods=["POST"])
@@ -110,8 +139,11 @@ def upload_sop():
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-    if not file.filename.endswith('.docx'):
-        return jsonify({"error": "File must be a .docx"}), 400
+
+    ext = file.filename.split('.')[-1].lower()
+    if ext not in ['docx', 'pdf']:
+        return jsonify({"error": "File must be a .docx or .pdf"}), 400
+
     save_path = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(save_path)
     update_status(file.filename, "processing")
@@ -125,6 +157,9 @@ def sop_status():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
+
+
 
 
 
