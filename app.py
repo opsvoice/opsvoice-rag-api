@@ -1,54 +1,82 @@
 from flask import Flask, request, jsonify
-import os
-import glob
-import json
+import os, glob, json
+from threading import Thread
+from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
+import time
 
-def get_persist_directory():
-    if os.environ.get("RENDER", "") == "true" or "/data" in os.getcwd():
-        return "/data/chroma_db"
-    else:
-        return os.path.join("chroma", "chroma_db")
+# ---- Paths ----
+DATA_PATH = "/data"
+SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
+CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
+STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
+os.makedirs(SOP_FOLDER, exist_ok=True)
+os.makedirs(CHROMA_DIR, exist_ok=True)
 
-def get_upload_folder():
-    if os.environ.get("RENDER", "") == "true" or "/data" in os.getcwd():
-        return "/data/sop-files/"
-    else:
-        return os.path.join("sop-files")
-
-persist_directory = get_persist_directory()
-UPLOAD_FOLDER = get_upload_folder()
-STATUS_FILE = os.path.join(UPLOAD_FOLDER, "status.json")
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(persist_directory, exist_ok=True)
-
-# Load vectorstore ONCE at startup
 embedding = OpenAIEmbeddings()
-vectorstore = Chroma(
-    persist_directory=persist_directory,
-    embedding_function=embedding,
-)
-# Limit memory/RAM use for retrieval
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+vectorstore = None  # will be loaded after embedding
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=ChatOpenAI(temperature=0, max_tokens=512),
-    chain_type="stuff",
-    retriever=retriever
-)
+def embed_sop_worker(fpath):
+    """Background embedding worker, called with full file path."""
+    fname = os.path.basename(fpath)
+    try:
+        print(f"[WORKER] Embedding file: {fpath}")
+        ext = fname.split('.')[-1].lower()
+        if ext == "docx":
+            docs = UnstructuredWordDocumentLoader(fpath).load()
+        elif ext == "pdf":
+            docs = PyPDFLoader(fpath).load()
+        else:
+            raise Exception("Unsupported file type")
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+        chunks = splitter.split_documents(docs)
+        print(f"[WORKER] {fname}: {len(chunks)} chunks")
+        if not chunks:
+            raise Exception("No content extracted from file")
+        # Load (or create) Chroma, append new docs
+        db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+        db.add_documents(chunks)
+        db.persist()
+        update_status(fname, "embedded")
+        print(f"[WORKER] Embedded {fname} successfully.")
+    except Exception as e:
+        update_status(fname, f"error: {str(e)}")
+        print(f"[WORKER] ERROR embedding {fname}: {e}")
+
+def update_status(filename, status):
+    try:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, "r") as f:
+                status_dict = json.load(f)
+        else:
+            status_dict = {}
+        status_dict[filename] = status
+        with open(STATUS_FILE, "w") as f:
+            json.dump(status_dict, f)
+    except Exception as e:
+        print("Error updating status:", e)
+
+def load_vectorstore():
+    global vectorstore
+    print("[INFO] Loading vectorstore from disk...")
+    vectorstore = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embedding,
+    )
+    print("[INFO] Vectorstore loaded.")
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🚀 OpsVoice API is live!"
+    return "🚀 OpsVoice API (single service) is live!"
 
 @app.route("/list-sops", methods=["GET"])
 def list_sops():
-    files = glob.glob(os.path.join(UPLOAD_FOLDER, "*.docx")) + glob.glob(os.path.join(UPLOAD_FOLDER, "*.pdf"))
+    files = glob.glob(os.path.join(SOP_FOLDER, "*.docx")) + glob.glob(os.path.join(SOP_FOLDER, "*.pdf"))
     return jsonify(files)
 
 @app.route("/upload-sop", methods=["POST"])
@@ -61,26 +89,34 @@ def upload_sop():
     ext = file.filename.split('.')[-1].lower()
     if ext not in ['docx', 'pdf']:
         return jsonify({"error": "File must be a .docx or .pdf"}), 400
-    save_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    save_path = os.path.join(SOP_FOLDER, file.filename)
     file.save(save_path)
-    # NOTE: Must manually run embed_sop.py + restart service to reload DB!
-    return jsonify({"message": f"File {file.filename} uploaded! It will be embedded and searchable soon."})
+    update_status(file.filename, "embedding...")
+    Thread(target=embed_sop_worker, args=(save_path,)).start()
+    return jsonify({"message": f"File {file.filename} uploaded. Embedding in background."})
 
 @app.route("/query", methods=["POST"])
 def query_sop():
+    global vectorstore
+    if vectorstore is None:
+        load_vectorstore()
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=ChatOpenAI(temperature=0, max_tokens=512),
+        chain_type="stuff",
+        retriever=retriever
+    )
     data = request.get_json()
     user_query = data.get("query")
     if not user_query:
         return jsonify({"error": "No query provided"}), 400
     try:
         sop_answer = qa_chain.invoke(user_query)
-        # RetrievalQA result is usually a dict with 'result' or 'answer'
         answer_text = ""
         if isinstance(sop_answer, dict):
             answer_text = sop_answer.get("result") or sop_answer.get("answer") or ""
         else:
             answer_text = str(sop_answer)
-
         if not answer_text or "don't know" in answer_text.lower() or "no information" in answer_text.lower():
             llm = ChatOpenAI(temperature=0, max_tokens=256)
             prompt = f"The company SOPs do not cover this. Please provide a general business best practice for: {user_query}"
@@ -107,9 +143,16 @@ def sop_status():
     else:
         return jsonify({})
 
+@app.route("/reload-db", methods=["POST"])
+def reload_db():
+    load_vectorstore()
+    return jsonify({"message": "Vectorstore reloaded from disk."})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    load_vectorstore()
     app.run(host="0.0.0.0", port=port)
+
 
 
 
