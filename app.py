@@ -2,12 +2,29 @@ from flask import Flask, request, jsonify
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
+from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os
 
 app = Flask(__name__)
 
+UPLOAD_FOLDER = "/data/sop-files/"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Embedding logic for a single doc upload
+def embed_single_doc(file_path):
+    loader = UnstructuredWordDocumentLoader(file_path)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    embeddings = OpenAIEmbeddings()
+    persist_directory = "/data/chroma_db"
+    vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+    vectorstore.add_documents(chunks)
+    vectorstore.persist()
+
 # Load ChromaDB vectorstore (DO NOT re-embed here!)
-persist_directory = "./chroma_db"
+persist_directory = "/data/chroma_db"
 embedding = OpenAIEmbeddings()
 vectorstore = Chroma(
     persist_directory=persist_directory,
@@ -27,8 +44,8 @@ def home():
 @app.route("/list-sops", methods=["GET"])
 def list_sops():
     import glob
-    files = glob.glob("sop-files/*.docx")
-    # You can also add more formats: "sop-files/*.pdf", etc.
+    files = glob.glob(f"{UPLOAD_FOLDER}*.docx")
+    # You can also add more formats: f"{UPLOAD_FOLDER}*.pdf", etc.
     return jsonify(files)
 
 @app.route("/query", methods=["POST"])
@@ -60,7 +77,27 @@ def voice_query():
     # Redirect /voice-query POST requests to the existing query_sop function
     return query_sop()
 
+@app.route("/upload-sop", methods=["POST"])
+def upload_sop():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in request"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    if not file.filename.endswith('.docx'):
+        return jsonify({"error": "File must be a .docx"}), 400
+    save_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(save_path)
+
+    # Call embedding logic
+    try:
+        embed_single_doc(save_path)
+        return jsonify({"message": f"File {file.filename} uploaded and embedded successfully!"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
