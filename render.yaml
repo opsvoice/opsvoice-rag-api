@@ -2,14 +2,14 @@ services:
   - type: web
     name: opsvoice-rag-api
     env: python
-    plan: standard   # <--- change to 'standard' (paid plan) for disk support
+    plan: standard     # You need 'standard' or higher for disk support!
     buildCommand: pip install -r requirements.txt
-    startCommand: python embed_sop.py && python app.py   # <--- runs embedding first!
+    startCommand: python embed_sop.py && gunicorn -b 0.0.0.0:10000 app:app   # Use gunicorn for production!
     envVars:
       - key: PORT
         value: 10000
       - key: OPENAI_API_KEY
-        sync: false   # or set 'true' and put value here, but better to keep it in dashboard
+        sync: false   # Keep in dashboard for security
     disk:
       name: data
       mountPath: /data

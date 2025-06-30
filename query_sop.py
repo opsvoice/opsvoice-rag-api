@@ -4,7 +4,7 @@ from langchain.chains import RetrievalQA
 import os
 
 # 1. Load ChromaDB with existing embeddings (DON'T re-embed every time)
-persist_directory = "./chroma_db"
+persist_directory = "/data/chroma_db"   # <--- use persistent Render disk path!
 embedding = OpenAIEmbeddings()
 
 vectorstore = Chroma(
@@ -30,4 +30,5 @@ if not sop_answer or "don't know" in sop_answer.lower() or "no information" in s
     print(f"Not found in SOP. General business best practice:\n{best_practice_answer.content}")
 else:
     print(f"Answer from company SOPs:\n{sop_answer}")
+
 

@@ -23,7 +23,7 @@ chunks = splitter.split_documents(all_docs)
 
 # 3. Embed and save to ChromaDB
 embeddings = OpenAIEmbeddings()  # will use env var OPENAI_API_KEY
-persist_directory = "./chroma_db"
+persist_directory = "/data/chroma_db"
 vectorstore = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=persist_directory)
 
 print(f"Embedded {len(doc_paths)} SOPs and saved {len(chunks)} chunks to ChromaDB!")
