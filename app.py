@@ -8,23 +8,39 @@ import os
 
 app = Flask(__name__)
 
-UPLOAD_FOLDER = "/data/sop-files/"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# ----- Path Setup (Windows/local vs Render) -----
+def get_persist_directory():
+    if os.environ.get("RENDER", "") == "true" or "/data" in os.getcwd():
+        # On Render or Linux container
+        return "/data/chroma_db"
+    else:
+        # Local dev (Windows/Mac/Linux)
+        return os.path.join("chroma", "chroma_db")
 
-# Embedding logic for a single doc upload
+def get_upload_folder():
+    if os.environ.get("RENDER", "") == "true" or "/data" in os.getcwd():
+        return "/data/sop-files/"
+    else:
+        return os.path.join("sop-files")
+
+persist_directory = get_persist_directory()
+UPLOAD_FOLDER = get_upload_folder()
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(persist_directory, exist_ok=True)
+
+# ----- Embedding logic for a single doc upload -----
 def embed_single_doc(file_path):
     loader = UnstructuredWordDocumentLoader(file_path)
     docs = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
     embeddings = OpenAIEmbeddings()
-    persist_directory = "/data/chroma_db"
     vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
     vectorstore.add_documents(chunks)
     vectorstore.persist()
 
-# Load ChromaDB vectorstore (DO NOT re-embed here!)
-persist_directory = "/data/chroma_db"
+# ----- Load ChromaDB vectorstore (DO NOT re-embed here!) -----
 embedding = OpenAIEmbeddings()
 vectorstore = Chroma(
     persist_directory=persist_directory,
@@ -44,8 +60,7 @@ def home():
 @app.route("/list-sops", methods=["GET"])
 def list_sops():
     import glob
-    files = glob.glob(f"{UPLOAD_FOLDER}*.docx")
-    # You can also add more formats: f"{UPLOAD_FOLDER}*.pdf", etc.
+    files = glob.glob(os.path.join(UPLOAD_FOLDER, "*.docx"))
     return jsonify(files)
 
 @app.route("/query", methods=["POST"])
@@ -56,7 +71,7 @@ def query_sop():
         return jsonify({"error": "No query provided"}), 400
 
     # Try to answer from SOPs
-    sop_answer = qa_chain.run(user_query)
+    sop_answer = qa_chain.invoke(user_query)  # CHANGED from run() to invoke()
     # Fallback logic
     if not sop_answer or "don't know" in sop_answer.lower() or "no information" in sop_answer.lower():
         llm = ChatOpenAI(temperature=0)
