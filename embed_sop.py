@@ -6,10 +6,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 
-import pdfplumber
-
-# ---- Paths ----
-DATA_PATH = "/data" if os.environ.get("RENDER", "") == "true" or "/data" in os.getcwd() else "."
+# ---- Configurable paths ----
+DATA_PATH = "/data"
 SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
 CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
 STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
@@ -30,46 +28,68 @@ def update_status(filename, status):
     except Exception as e:
         print("Error updating status:", e)
 
-# ---- DEBUG: Print found files ----
-print(f"Looking for .docx and .pdf in: {SOP_FOLDER}")
+# ---- Debug: print what's in the folder ----
+try:
+    print("Listing /data:", os.listdir(DATA_PATH))
+    print("Listing /data/sop-files:", os.listdir(SOP_FOLDER))
+except Exception as e:
+    print(f"Error listing directory: {e}")
+
+# ---- Find files ----
 docx_files = glob.glob(os.path.join(SOP_FOLDER, "*.docx"))
 pdf_files = glob.glob(os.path.join(SOP_FOLDER, "*.pdf"))
+
 print("DOCX files found:", docx_files)
 print("PDF files found:", pdf_files)
 
 all_docs = []
+
+def load_docx(fpath):
+    return UnstructuredWordDocumentLoader(fpath).load()
+
+def load_pdf(fpath):
+    from langchain_community.document_loaders import PyPDFLoader
+    loader = PyPDFLoader(fpath)
+    return loader.load()
+
 for fpath in docx_files + pdf_files:
     try:
+        fname = os.path.basename(fpath)
         ext = fpath.split('.')[-1].lower()
         print(f"Processing: {fpath} (ext: {ext})")
+
         if ext == "docx":
-            docs = UnstructuredWordDocumentLoader(fpath).load()
+            docs = load_docx(fpath)
         elif ext == "pdf":
-            with pdfplumber.open(fpath) as pdf:
-                text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-            docs = [{"page_content": text}]
+            docs = load_pdf(fpath)
         else:
             print("Skipped unsupported file type:", ext)
             continue
+
         splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
         chunks = splitter.split_documents(docs)
-        print(f"Extracted {len(chunks)} chunks from {os.path.basename(fpath)}")
+        print(f"Extracted {len(chunks)} chunks from {fname}")
         all_docs.extend(chunks)
-        update_status(os.path.basename(fpath), "embedded")
-        print(f"[EMBEDDED] {os.path.basename(fpath)}: {len(chunks)} chunks.")
+        update_status(fname, "embedded")
+        print(f"[EMBEDDED] {fname}: {len(chunks)} chunks.")
     except Exception as e:
-        update_status(os.path.basename(fpath), f"error: {str(e)}")
-        print(f"[FAILED] {os.path.basename(fpath)}: {str(e)}")
+        update_status(fname, f"error: {str(e)}")
+        print(f"[FAILED] {fname}: {str(e)}")
 
-# ---- DEBUG: Check if any docs/chunks were extracted ----
 print(f"Total chunks to embed: {len(all_docs)}")
 
 if not all_docs:
     print("No documents to embed! Exiting early.")
     exit(0)
 
-embeddings = OpenAIEmbeddings()
-Chroma.from_documents(all_docs, embedding=embeddings, persist_directory=CHROMA_DIR)
-print(f"Embedded {len(all_docs)} total SOP chunks to ChromaDB!")
+# ---- Embedding ----
+try:
+    embeddings = OpenAIEmbeddings()
+    Chroma.from_documents(all_docs, embedding=embeddings, persist_directory=CHROMA_DIR)
+    print(f"Embedded {len(all_docs)} total SOP chunks to ChromaDB!")
+except Exception as e:
+    print(f"[EMBEDDING FAILED]: {e}")
+    exit(1)
+
 
 
