@@ -2,9 +2,16 @@ services:
   - type: web
     name: opsvoice-rag-api
     env: python
-    plan: free
+    plan: standard   # <--- change to 'standard' (paid plan) for disk support
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: python embed_sop.py && python app.py   # <--- runs embedding first!
     envVars:
       - key: PORT
         value: 10000
+      - key: OPENAI_API_KEY
+        sync: false   # or set 'true' and put value here, but better to keep it in dashboard
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+
