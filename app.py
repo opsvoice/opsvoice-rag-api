@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import os, glob, json
 from threading import Thread
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
@@ -13,15 +13,14 @@ SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
 CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
 STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
 
-# Only create subfolders; /data already exists on Render disk mount
+# Create required folders
 os.makedirs(SOP_FOLDER, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 
 embedding = OpenAIEmbeddings()
-vectorstore = None  # will be loaded after embedding
+vectorstore = None  # loaded later
 
 def embed_sop_worker(fpath, metadata=None):
-    """Background embedding worker, called with full file path and optional metadata."""
     fname = os.path.basename(fpath)
     try:
         print(f"[WORKER] Embedding file: {fpath}")
@@ -40,12 +39,10 @@ def embed_sop_worker(fpath, metadata=None):
         if not chunks:
             raise Exception("No content extracted from file")
 
-        # Attach metadata to each chunk (multi-tenant support)
         if metadata:
             for chunk in chunks:
                 chunk.metadata.update(metadata)
 
-        # Load (or create) Chroma, append new docs
         db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
         db.add_documents(chunks)
         db.persist()
@@ -90,6 +87,11 @@ def load_vectorstore():
 
 app = Flask(__name__)
 
+# Serve uploaded files for public access
+@app.route("/static/sop-files/<path:filename>")
+def serve_file(filename):
+    return send_from_directory(SOP_FOLDER, filename)
+
 @app.route("/")
 def home():
     return "🚀 OpsVoice API (multi-tenant) is live!"
@@ -120,6 +122,10 @@ def upload_sop():
     save_path = os.path.join(SOP_FOLDER, file.filename)
     file.save(save_path)
 
+    # ✅ Generate public file URL from static route
+    base_url = request.host_url.rstrip("/")  # Automatically picks up Render domain
+    sop_file_url = f"{base_url}/static/sop-files/{file.filename}"
+
     metadata = {
         "title": doc_title,
         "company_id": company_id,
@@ -132,7 +138,8 @@ def upload_sop():
     return jsonify({
         "message": f"File {file.filename} uploaded. Embedding in background.",
         "doc_title": doc_title,
-        "company_id": company_id
+        "company_id": company_id,
+        "sop_file_url": sop_file_url
     })
 
 @app.route("/query", methods=["POST"])
@@ -152,7 +159,6 @@ def query_sop():
     print(f"[QUERY] Question: {user_query}")
 
     try:
-        # Filter documents by metadata
         retriever = vectorstore.as_retriever(
             search_kwargs={
                 "k": 3,
@@ -167,14 +173,9 @@ def query_sop():
         )
 
         sop_answer = qa_chain.invoke(user_query)
-        answer_text = ""
+        answer_text = sop_answer.get("result") if isinstance(sop_answer, dict) else str(sop_answer)
 
-        if isinstance(sop_answer, dict):
-            answer_text = sop_answer.get("result") or sop_answer.get("answer") or ""
-        else:
-            answer_text = str(sop_answer)
-
-        if not answer_text or "don't know" in answer_text.lower() or "no information" in answer_text.lower():
+        if not answer_text or "don't know" in answer_text.lower():
             llm = ChatOpenAI(temperature=0, max_tokens=256)
             prompt = f"The company SOPs do not cover this. Please provide a general business best practice for: {user_query}"
             best_practice_answer = llm.invoke(prompt)
