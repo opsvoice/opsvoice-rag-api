@@ -3,7 +3,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
 import os
 
-# 1. Load ChromaDB with existing embeddings (DON'T re-embed every time)
+# 1. Load ChromaDB with existing embeddings
 persist_directory = "/data/chroma_db"   # <--- use persistent Render disk path!
 embedding = OpenAIEmbeddings()
 
@@ -12,7 +12,15 @@ vectorstore = Chroma(
     embedding_function=embedding,
 )
 
-retriever = vectorstore.as_retriever()
+# --- NEW: Prompt for company_id!
+company_id = input("Enter company_id to search: ").strip()
+
+retriever = vectorstore.as_retriever(
+    search_kwargs={
+        "k": 3,
+        "filter": {"company_id": company_id}
+    }
+)
 qa_chain = RetrievalQA.from_chain_type(
     llm=ChatOpenAI(temperature=0),
     chain_type="stuff",
