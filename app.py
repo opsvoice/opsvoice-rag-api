@@ -208,7 +208,7 @@ def reload_db():
     return jsonify({"message": "Vectorstore reloaded from disk."})
 
     @app.route("/company-docs/<company_id>", methods=["GET"])
-def company_docs(company_id):
+    def company_docs(company_id):
     # Get status.json mapping of file info
     if not os.path.exists(STATUS_FILE):
         return jsonify([])
