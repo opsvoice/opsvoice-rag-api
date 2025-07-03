@@ -207,8 +207,11 @@ def reload_db():
     load_vectorstore()
     return jsonify({"message": "Vectorstore reloaded from disk."})
 
-    @app.route("/company-docs/<company_id>", methods=["GET"])
-    def company_docs(company_id):
+# ---------------------------
+# Corrected /company-docs endpoint
+# ---------------------------
+@app.route("/company-docs/<company_id>", methods=["GET"])
+def company_docs(company_id):
     # Get status.json mapping of file info
     if not os.path.exists(STATUS_FILE):
         return jsonify([])
@@ -235,4 +238,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     load_vectorstore()
     app.run(host="0.0.0.0", port=port)
-
