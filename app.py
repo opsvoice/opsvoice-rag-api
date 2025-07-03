@@ -207,6 +207,30 @@ def reload_db():
     load_vectorstore()
     return jsonify({"message": "Vectorstore reloaded from disk."})
 
+    @app.route("/company-docs/<company_id>", methods=["GET"])
+def company_docs(company_id):
+    # Get status.json mapping of file info
+    if not os.path.exists(STATUS_FILE):
+        return jsonify([])
+
+    with open(STATUS_FILE, "r") as f:
+        status_dict = json.load(f)
+    
+    # Filter files belonging to the requested company_id
+    docs = []
+    for fname, meta in status_dict.items():
+        # match by company_id, OR use meta.get("company_slug") if that's your key!
+        if meta.get("company_id") == company_id:
+            docs.append({
+                "filename": fname,
+                "title": meta.get("title", fname),
+                "company_id": company_id,
+                "status": meta.get("status"),
+                "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{fname}"
+            })
+
+    return jsonify(docs)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     load_vectorstore()
