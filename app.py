@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, send_from_directory
-import os, glob, json
+import os, glob, json, re, time
 from threading import Thread
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -142,6 +142,53 @@ def upload_sop():
         "sop_file_url": sop_file_url
     })
 
+# ---- Advanced /query endpoint ----
+# ---------------------------------
+query_counts = {}
+RATE_LIMIT_PER_MIN = 15  # e.g., 15 queries per company_id per minute
+
+def check_rate_limit(company_id):
+    now = int(time.time() / 60)  # current minute as int
+    key = f"{company_id}-{now}"
+    query_counts.setdefault(key, 0)
+    query_counts[key] += 1
+    return query_counts[key] <= RATE_LIMIT_PER_MIN
+
+COMPANY_PERSONALITY = {
+    "nzIvTy1QAd2bQvhs4d5Y": "Cades Market: Friendly, straightforward, local grocery expertise.",
+    # Add more company_id: "Brand personality/voice" here
+}
+
+def contains_sensitive(text):
+    if not text:
+        return False
+    patterns = [
+        r"\bssn\b|\bsocial security\b|\b\d{3}-\d{2}-\d{4}\b",         # SSN
+        r"\b\d{5,}\b",                                                # suspicious long numbers
+        r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",                         # phone numbers
+        r"\$[\d,]+(\.\d{2})?",                                        # dollar amounts
+        r"\bsalary\b|\bwage\b|\bcompensation\b",                      # salary/wage terms
+        r"\bemail\b|\b@\w+\.\w+\b",                                   # emails
+    ]
+    combined = "|".join(patterns)
+    return bool(re.search(combined, text, re.IGNORECASE))
+
+def generate_followups(question, answer):
+    base = [
+        "Do you want to know more details?",
+        "Would you like steps for a related task?",
+        "Need help finding a specific document?"
+    ]
+    q = (question or "").lower()
+    if "invoice" in q:
+        base = ["Do you want steps to send an invoice?", "Need help editing invoices?"] + base
+    if "onboard" in q or "hire" in q:
+        base = ["Want to know about required documents for new hires?"] + base
+    return base[:3]
+
+def is_vague_query(query):
+    return not query or len(query.strip().split()) < 3 or query.strip().endswith("?") == False
+
 @app.route("/query", methods=["POST"])
 def query_sop():
     global vectorstore
@@ -149,14 +196,60 @@ def query_sop():
         load_vectorstore()
 
     data = request.get_json()
-    user_query = data.get("query")
-    company_id = data.get("company_id")
+    user_query = data.get("query", "")
+    company_id = data.get("company_id", "")
 
     if not user_query or not company_id:
         return jsonify({"error": "Missing query or company_id"}), 400
 
-    print(f"[QUERY] Company ID: {company_id}")
-    print(f"[QUERY] Question: {user_query}")
+    # 0. If user asks for list of documents, short-circuit to doc list!
+    DOC_LIST_TRIGGERS = [
+        "what are my uploaded sops", "list my documents", "list uploaded docs", 
+        "list company documents", "show company docs", "what documents do i have"
+    ]
+    if user_query.strip().lower() in DOC_LIST_TRIGGERS:
+        # return document list for that company
+        if not os.path.exists(STATUS_FILE):
+            return jsonify({"docs": []})
+        with open(STATUS_FILE, "r") as f:
+            status_dict = json.load(f)
+        docs = []
+        for fname, meta in status_dict.items():
+            if meta.get("company_id") == company_id:
+                docs.append({
+                    "filename": fname,
+                    "title": meta.get("title", fname),
+                    "company_id": company_id,
+                    "status": meta.get("status"),
+                    "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{fname}"
+                })
+        return jsonify({
+            "answer": f"You have {len(docs)} uploaded documents.",
+            "docs": docs,
+            "source": "company_docs"
+        })
+
+    # 1. Rate Limit
+    if not check_rate_limit(company_id):
+        return jsonify({"error": "Too many requests. Please wait a minute before asking again."}), 429
+
+    # 2. Company Brand Personality
+    personality = COMPANY_PERSONALITY.get(company_id, "")
+
+    # 3. Context-Aware Redirect (very off-topic queries)
+    REDIRECT_TOPICS = ["gmail", "outlook", "email password", "reset password", "facebook", "amazon account", "personal bank"]
+    if any(t in user_query.lower() for t in REDIRECT_TOPICS):
+        return jsonify({
+            "answer": "Sorry, that question is outside of your company documents. For this type of issue, please contact your IT department or use the official help portal.",
+            "source": "redirect"
+        })
+
+    # 4. Clarity Prompt
+    if is_vague_query(user_query):
+        return jsonify({
+            "answer": "Could you provide a little more detail? (For example, specify which process or document you’re referring to.)",
+            "source": "clarify"
+        })
 
     try:
         retriever = vectorstore.as_retriever(
@@ -165,30 +258,45 @@ def query_sop():
                 "filter": {"company_id": company_id}
             }
         )
-
         qa_chain = RetrievalQA.from_chain_type(
             llm=ChatOpenAI(temperature=0, max_tokens=512),
             chain_type="stuff",
             retriever=retriever
         )
-
         sop_answer = qa_chain.invoke(user_query)
         answer_text = sop_answer.get("result") if isinstance(sop_answer, dict) else str(sop_answer)
 
-        if not answer_text or "don't know" in answer_text.lower():
+        # 5. Sensitive Guardrails
+        if contains_sensitive(answer_text):
+            return jsonify({
+                "answer": "Sorry, this answer may contain sensitive or private information and can’t be provided by voice. Please contact your company admin for access.",
+                "source": "sensitive_guard"
+            })
+
+        # 6. Quick Summary
+        summary_msg = ""
+        if answer_text and len(answer_text.split()) > 50:
+            summary_msg = "Quick summary: " + " ".join(answer_text.split()[:30]) + "... Want more details? Just ask!"
+
+        # 7. Best Practices Fallback
+        if not answer_text or "don't know" in answer_text.lower() or "no information" in answer_text.lower():
             llm = ChatOpenAI(temperature=0, max_tokens=256)
             prompt = f"The company SOPs do not cover this. Please provide a general business best practice for: {user_query}"
             best_practice_answer = llm.invoke(prompt)
             bp_text = best_practice_answer.content if hasattr(best_practice_answer, "content") else str(best_practice_answer)
             return jsonify({
                 "source": "general_best_practice",
-                "answer": bp_text
+                "answer": f"{personality} A general best practice is: {bp_text}\n\nIf you want more specifics, try rephrasing or uploading a document.",
+                "followups": generate_followups(user_query, bp_text)
             })
-        else:
-            return jsonify({
-                "source": "sop",
-                "answer": answer_text
-            })
+
+        # 8. Brand Personality + Summary + Followup Suggestions
+        response = {
+            "source": "sop",
+            "answer": (personality + " " if personality else "") + (summary_msg + "\n" if summary_msg else "") + answer_text,
+            "followups": generate_followups(user_query, answer_text)
+        }
+        return jsonify(response)
 
     except Exception as e:
         print(f"[ERROR] Query failed: {e}")
@@ -207,9 +315,6 @@ def reload_db():
     load_vectorstore()
     return jsonify({"message": "Vectorstore reloaded from disk."})
 
-# ---------------------------
-# Corrected /company-docs endpoint
-# ---------------------------
 @app.route("/company-docs/<company_id>", methods=["GET"])
 def company_docs(company_id):
     # Get status.json mapping of file info
@@ -222,7 +327,6 @@ def company_docs(company_id):
     # Filter files belonging to the requested company_id
     docs = []
     for fname, meta in status_dict.items():
-        # match by company_id, OR use meta.get("company_slug") if that's your key!
         if meta.get("company_id") == company_id:
             docs.append({
                 "filename": fname,
