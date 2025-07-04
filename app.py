@@ -1,14 +1,12 @@
-from flask import Flask, request, jsonify, send_from_directory
-import os, glob, json, re, time
+from flask import Flask, request, jsonify, send_from_directory, send_file, make_response
+import os, glob, json, re, time, io, requests
 from threading import Thread
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
-from flask import Flask
 from flask_cors import CORS
-
 
 # ---- Paths ----
 DATA_PATH = "/data"
@@ -89,9 +87,52 @@ def load_vectorstore():
     print("[INFO] Vectorstore loaded.")
 
 app = Flask(__name__)
-CORS(app, origins=["https://opsvoice-widget.vercel.app"])
 CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"])
 
+# ---- Mobile Audio Endpoint for Voice Assistant ----
+@app.route('/voice-reply', methods=['POST', 'OPTIONS'])
+def voice_reply():
+    # Handle CORS preflight for browsers (mobile/desktop)
+    if request.method == 'OPTIONS':
+        response = make_response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        return response
+
+    # Main POST logic
+    data = request.get_json()
+    query_text = data.get('query', '')
+
+    # ElevenLabs API (always returns MP3 stream)
+    el_resp = requests.post(
+        'https://api.elevenlabs.io/v1/text-to-speech/YOUR_VOICE_ID/stream',
+        headers={
+            "xi-api-key": "YOUR_ELEVENLABS_API_KEY"
+        },
+        json={
+            "text": query_text
+        }
+    )
+
+    audio_bytes = io.BytesIO(el_resp.content)
+    response = make_response(send_file(
+        audio_bytes,
+        mimetype="audio/mpeg",
+        as_attachment=False,
+        download_name="reply.mp3"
+    ))
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return response
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return response
 
 # Serve uploaded files for public access
 @app.route("/static/sop-files/<path:filename>")
