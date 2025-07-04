@@ -6,6 +6,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import RetrievalQA
+from flask import Flask
+from flask_cors import CORS
+
 
 # ---- Paths ----
 DATA_PATH = "/data"
@@ -86,6 +89,9 @@ def load_vectorstore():
     print("[INFO] Vectorstore loaded.")
 
 app = Flask(__name__)
+CORS(app, origins=["https://opsvoice-widget.vercel.app"])
+CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"])
+
 
 # Serve uploaded files for public access
 @app.route("/static/sop-files/<path:filename>")
