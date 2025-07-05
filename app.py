@@ -1,3 +1,5 @@
+# Updated app.py with optimizations and fixes (except #4 memory persistence)
+
 from flask import Flask, request, jsonify, send_from_directory, send_file, make_response
 import os, glob, json, re, time, io, shutil, requests
 from dotenv import load_dotenv
@@ -45,7 +47,8 @@ def add_cors(response):
 
 # ---- Text Utilities ----
 def clean_text(txt: str) -> str:
-    return re.sub(r"\s+", " ", txt or "").strip()
+    txt = re.sub(r"\s+", " ", txt or "")
+    return txt.replace("\u2022", "-").replace("\t", " ").strip()
 
 def is_unhelpful_answer(text):
     if not text or not text.strip(): return True
@@ -54,7 +57,7 @@ def is_unhelpful_answer(text):
     return any(t in low for t in triggers) or len(low.split()) < 6
 
 def contains_sensitive(text):
-    patterns = [r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}", r"\$\d+[,\d]*(\.\d\d)?"]
+    patterns = [r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}", r"\$\d+[\,\d]*(\.\d\d)?"]
     return bool(re.search("|".join(patterns), text, re.IGNORECASE))
 
 def generate_followups(q):
@@ -95,7 +98,7 @@ def load_vectorstore():
 
 # ---- Routes ----
 @app.route("/")
-def home(): return "🚀 OpsVoice RAG API is live!"
+def home(): return "\U0001F680 OpsVoice RAG API is live!"
 
 @app.route("/healthz")
 def healthz(): return jsonify({"status": "ok"})
@@ -153,13 +156,15 @@ def query_sop():
         return jsonify({"error":"Too many requests, try again in a minute."}), 429
 
     if is_vague(qtext):
-        return jsonify({"answer":"Can you give me more detail? E.g. which SOP or process you mean.","source":"clarify"})
+        return jsonify({"answer":"Can you give me more detail—like the specific SOP or process you’re referring to?","source":"clarify"})
 
     if any(t in qtext.lower() for t in ["gmail","facebook","amazon account"]):
         return jsonify({"answer":"That’s outside your SOPs—please use the official help portal.","source":"off_topic"})
 
     try:
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3, "filter": {"company_id_slug": tenant}})
+        retriever = vectorstore.as_retriever(
+            search_kwargs={"k": 5, "filter": {"company_id_slug": tenant}, "score_threshold": 0.5}
+        )
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         qa = ConversationalRetrievalChain.from_llm(
             ChatOpenAI(temperature=0),
@@ -183,6 +188,9 @@ def query_sop():
                 "followups": generate_followups(qtext),
                 "source": "fallback"
             })
+
+        if len(answer.split()) > 100:
+            answer = "Let me give you a short summary. " + " ".join(answer.split()[:50]) + "..."
 
         return jsonify({
             "answer": f"{COMPANY_VOICES.get(tenant,'')} {answer}",
@@ -219,6 +227,20 @@ def voice_reply():
 def sop_status():
     if os.path.exists(STATUS_FILE): return send_file(STATUS_FILE)
     return jsonify({})
+
+@app.route("/lookup-slug")
+def lookup_slug():
+    email = request.args.get("email", "").strip().lower()
+    if not email or not os.path.exists(STATUS_FILE):
+        return jsonify({"error": "Invalid email or missing status"}), 400
+
+    data = json.load(open(STATUS_FILE))
+    for meta in data.values():
+        if meta.get("uploaded_by", "").strip().lower() == email:
+            return jsonify({"slug": meta.get("company_id_slug")})
+
+    return jsonify({"error": "Not found"}), 404
+
 
 @app.route("/reload-db", methods=["POST"])
 def reload_db():
