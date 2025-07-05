@@ -1,410 +1,238 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file, make_response
-import os, glob, json, re, time, io, requests
+import os, glob, json, re, time, io, shutil, requests
+from dotenv import load_dotenv
+load_dotenv()
 from threading import Thread
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.chains import RetrievalQA
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
 from flask_cors import CORS
 
-# ---- Paths ----
-DATA_PATH = "/data"
-SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
-CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
-STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
+# ---- Paths & Setup ----
+DATA_PATH    = "/data"
+SOP_FOLDER   = os.path.join(DATA_PATH, "sop-files")
+CHROMA_DIR   = os.path.join(DATA_PATH, "chroma_db")
+STATUS_FILE  = os.path.join(SOP_FOLDER, "status.json")
 
-# Create required folders
 os.makedirs(SOP_FOLDER, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 
+# Clean Chroma on startup
+if os.path.exists(CHROMA_DIR):
+    try:
+        shutil.rmtree(CHROMA_DIR)
+        os.makedirs(CHROMA_DIR, exist_ok=True)
+        print(f"[CLEANUP] Cleaned ChromaDB at {CHROMA_DIR}")
+    except Exception as e:
+        print(f"[CLEANUP] Error: {e}")
+
 embedding = OpenAIEmbeddings()
-vectorstore = None  # loaded later
+vectorstore = None
 
-def embed_sop_worker(fpath, metadata=None):
-    fname = os.path.basename(fpath)
-    try:
-        print(f"[WORKER] Embedding file: {fpath}")
-        ext = fname.split('.')[-1].lower()
-        if ext == "docx":
-            docs = UnstructuredWordDocumentLoader(fpath).load()
-        elif ext == "pdf":
-            docs = PyPDFLoader(fpath).load()
-        else:
-            raise Exception("Unsupported file type")
-
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        chunks = splitter.split_documents(docs)
-
-        print(f"[WORKER] {fname}: {len(chunks)} chunks")
-        if not chunks:
-            raise Exception("No content extracted from file")
-
-        if metadata:
-            for chunk in chunks:
-                chunk.metadata.update(metadata)
-
-        db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
-        db.add_documents(chunks)
-        db.persist()
-
-        update_status(fname, {"status": "embedded", **metadata})
-        print(f"[WORKER] Embedded {fname} successfully.")
-    except Exception as e:
-        update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
-        print(f"[WORKER] ERROR embedding {fname}: {e}")
-
-def update_status(filename, status):
-    try:
-        if os.path.exists(STATUS_FILE):
-            with open(STATUS_FILE, "r") as f:
-                status_dict = json.load(f)
-        else:
-            status_dict = {}
-
-        if isinstance(status, dict):
-            status_dict[filename] = status
-        else:
-            existing = status_dict.get(filename, {})
-            if isinstance(existing, dict):
-                existing["status"] = status
-                status_dict[filename] = existing
-            else:
-                status_dict[filename] = {"status": status}
-
-        with open(STATUS_FILE, "w") as f:
-            json.dump(status_dict, f, indent=2)
-    except Exception as e:
-        print("Error updating status:", e)
-
-def load_vectorstore():
-    global vectorstore
-    print("[INFO] Loading vectorstore from disk...")
-    vectorstore = Chroma(
-        persist_directory=CHROMA_DIR,
-        embedding_function=embedding,
-    )
-    print("[INFO] Vectorstore loaded.")
-
+# ---- Flask Setup ----
 app = Flask(__name__)
 CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"])
 
-# ---- Utility: Detect unhelpful answer ----
-def is_unhelpful_answer(text):
-    """Detect if a RAG answer is blank, unhelpful, or clearly a fallback trigger."""
-    if not text or not text.strip():
-        return True
-    text_lower = text.lower().strip()
-    unhelpful_phrases = [
-        "don't know", "no information", "i'm not sure", "sorry", 
-        "i couldn't find", "not covered", "no relevant", "unavailable", "no answer"
-    ]
-    if any(phrase in text_lower for phrase in unhelpful_phrases):
-        return True
-    if len(text_lower.split()) < 6:
-        return True
-    return False
-
-# ---- Mobile Audio Endpoint for Voice Assistant ----
-@app.route('/voice-reply', methods=['POST', 'OPTIONS'])
-def voice_reply():
-    # Handle CORS preflight for browsers (mobile/desktop)
-    if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        return response
-
-    # Main POST logic
-    data = request.get_json()
-    query_text = data.get('query', '')
-
-    # ElevenLabs API (always returns MP3 stream)
-    el_resp = requests.post(
-        'https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream',
-        headers={
-            "xi-api-key": "sk_0b8e72ddb1dcb2092c83077f7d9d7a3c06c2cf0965a02df9"
-        },
-        json={
-            "text": query_text
-        }
-    )
-
-    audio_bytes = io.BytesIO(el_resp.content)
-    response = make_response(send_file(
-        audio_bytes,
-        mimetype="audio/mpeg",
-        as_attachment=False,
-        download_name="reply.mp3"
-    ))
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    return response
-
 @app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     return response
 
-# Serve uploaded files for public access
-@app.route("/static/sop-files/<path:filename>")
-def serve_file(filename):
-    return send_from_directory(SOP_FOLDER, filename)
+# ---- Text Utilities ----
+def clean_text(txt: str) -> str:
+    return re.sub(r"\s+", " ", txt or "").strip()
 
+def is_unhelpful_answer(text):
+    if not text or not text.strip(): return True
+    low = text.lower()
+    triggers = ["don't know", "no information", "i'm not sure", "sorry", "unavailable", "not covered"]
+    return any(t in low for t in triggers) or len(low.split()) < 6
+
+def contains_sensitive(text):
+    patterns = [r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}", r"\$\d+[,\d]*(\.\d\d)?"]
+    return bool(re.search("|".join(patterns), text, re.IGNORECASE))
+
+def generate_followups(q):
+    base = ["Do you want to know more details?", "Would you like steps for a related task?", "Need help finding a specific document?"]
+    q = q.lower()
+    if "invoice" in q: base.insert(0, "Do you want steps to send an invoice?")
+    if "onboard" in q or "hire" in q: base.insert(0, "Want to know about new-hire paperwork?")
+    return base[:3]
+
+def is_vague(query): return len(query.split()) < 3 or not query.strip().endswith("?")
+
+# ---- Embedding Worker ----
+def embed_sop_worker(fpath, metadata=None):
+    fname = os.path.basename(fpath)
+    try:
+        ext = fname.rsplit(".", 1)[-1].lower()
+        docs = UnstructuredWordDocumentLoader(fpath).load() if ext == "docx" else PyPDFLoader(fpath).load()
+        chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100).split_documents(docs)
+        for c in chunks: c.metadata.update(metadata or {})
+        db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+        db.add_documents(chunks)
+        db.persist()
+        update_status(fname, {"status": "embedded", **(metadata or {})})
+    except Exception as e:
+        update_status(fname, {"status": f"error: {e}", **(metadata or {})})
+
+def update_status(filename, status):
+    try:
+        data = json.load(open(STATUS_FILE)) if os.path.exists(STATUS_FILE) else {}
+        data[filename] = status
+        with open(STATUS_FILE, "w") as f: json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[STATUS] Error: {e}")
+
+def load_vectorstore():
+    global vectorstore
+    vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+
+# ---- Routes ----
 @app.route("/")
-def home():
-    return "🚀 OpsVoice API (multi-tenant) is live!"
+def home(): return "🚀 OpsVoice RAG API is live!"
 
-@app.route("/list-sops", methods=["GET"])
+@app.route("/healthz")
+def healthz(): return jsonify({"status": "ok"})
+
+@app.route("/list-sops")
 def list_sops():
-    files = glob.glob(os.path.join(SOP_FOLDER, "*.docx")) + glob.glob(os.path.join(SOP_FOLDER, "*.pdf"))
-    return jsonify(files)
+    docs = glob.glob(os.path.join(SOP_FOLDER, "*.docx")) + glob.glob(os.path.join(SOP_FOLDER, "*.pdf"))
+    return jsonify(docs)
+
+@app.route("/static/sop-files/<path:filename>")
+def serve_sop(filename): return send_from_directory(SOP_FOLDER, filename)
 
 @app.route("/upload-sop", methods=["POST"])
 def upload_sop():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part in request"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    ext = file.filename.split('.')[-1].lower()
-    if ext not in ['docx', 'pdf']:
-        return jsonify({"error": "File must be a .docx or .pdf"}), 400
+    file = request.files.get("file")
+    if not file or not file.filename: return jsonify({"error":"No file uploaded"}), 400
+    ext = file.filename.rsplit(".",1)[-1].lower()
+    if ext not in ("docx","pdf"): return jsonify({"error":"Only .docx/.pdf allowed"}), 400
 
-    doc_title = request.form.get("doc_title") or file.filename
-    company_id_slug = request.form.get("company_id_slug") or ""
+    tenant = request.form.get("company_id_slug", "")
+    title = request.form.get("doc_title", file.filename)
+    save_p = os.path.join(SOP_FOLDER, file.filename)
+    file.save(save_p)
 
-    print(f"[UPLOAD] File: {file.filename}")
-    print(f"[UPLOAD] Title: {doc_title}")
-    print(f"[UPLOAD] Company ID Slug: {company_id_slug}")
-
-    save_path = os.path.join(SOP_FOLDER, file.filename)
-    file.save(save_path)
-
-    base_url = request.host_url.rstrip("/")
-    sop_file_url = f"{base_url}/static/sop-files/{file.filename}"
-
-    metadata = {
-        "title": doc_title,
-        "company_id_slug": company_id_slug,
-        "status": "embedding..."
-    }
-    update_status(file.filename, metadata)
-
-    Thread(target=embed_sop_worker, args=(save_path, metadata)).start()
+    meta = {"title": title, "company_id_slug": tenant}
+    update_status(file.filename, {"status":"embedding...", **meta})
+    Thread(target=embed_sop_worker, args=(save_p, meta), daemon=True).start()
 
     return jsonify({
-        "message": f"File {file.filename} uploaded. Embedding in background.",
-        "doc_title": doc_title,
-        "company_id_slug": company_id_slug,
-        "sop_file_url": sop_file_url
+        "message": f"Uploaded {file.filename}, embedding in background.",
+        "doc_title": title,
+        "company_id_slug": tenant,
+        "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{file.filename}"
     })
 
-# ---- Query endpoint with hybrid fallback ----
-
 query_counts = {}
-RATE_LIMIT_PER_MIN = 15
-
-def check_rate_limit(company_id_slug):
-    now = int(time.time() / 60)
-    key = f"{company_id_slug}-{now}"
-    query_counts.setdefault(key, 0)
-    query_counts[key] += 1
-    return query_counts[key] <= RATE_LIMIT_PER_MIN
-
-COMPANY_PERSONALITY = {
-    "jaxdude-3057": "JaxDude: Straight to the point and helpful.",
-    # Add more company_id_slug: "Brand personality/voice" here
+RATE_LIMIT_MIN = 15
+COMPANY_VOICES = {
+    "jaxdude-3057": "JaxDude: Straight to the point and helpful."
 }
-
-def contains_sensitive(text):
-    if not text:
-        return False
-    patterns = [
-        r"\bssn\b|\bsocial security\b|\b\d{3}-\d{2}-\d{4}\b",
-        r"\b\d{5,}\b",
-        r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
-        r"\$[\d,]+(\.\d{2})?",
-        r"\bsalary\b|\bwage\b|\bcompensation\b",
-        r"\bemail\b|\b@\w+\.\w+\b",
-    ]
-    combined = "|".join(patterns)
-    return bool(re.search(combined, text, re.IGNORECASE))
-
-def generate_followups(question, answer):
-    base = [
-        "Do you want to know more details?",
-        "Would you like steps for a related task?",
-        "Need help finding a specific document?"
-    ]
-    q = (question or "").lower()
-    if "invoice" in q:
-        base = ["Do you want steps to send an invoice?", "Need help editing invoices?"] + base
-    if "onboard" in q or "hire" in q:
-        base = ["Want to know about required documents for new hires?"] + base
-    return base[:3]
-
-def is_vague_query(query):
-    return not query or len(query.strip().split()) < 3 or query.strip().endswith("?") == False
 
 @app.route("/query", methods=["POST"])
 def query_sop():
     global vectorstore
-    if vectorstore is None:
-        load_vectorstore()
+    if vectorstore is None: load_vectorstore()
 
-    data = request.get_json()
-    user_query = data.get("query", "")
-    company_id_slug = data.get("company_id_slug", "")
+    payload = request.get_json() or {}
+    qtext = clean_text(payload.get("query", ""))
+    tenant = payload.get("company_id_slug", "")
 
-    if not user_query or not company_id_slug:
-        return jsonify({"error": "Missing query or company_id_slug"}), 400
+    if not qtext or not tenant:
+        return jsonify({"error":"Missing query or tenant"}), 400
 
-    # Doc list shortcut
-    DOC_LIST_TRIGGERS = [
-        "what are my uploaded sops", "list my documents", "list uploaded docs",
-        "list company documents", "show company docs", "what documents do i have"
-    ]
-    if user_query.strip().lower() in DOC_LIST_TRIGGERS:
-        if not os.path.exists(STATUS_FILE):
-            return jsonify({"docs": []})
-        with open(STATUS_FILE, "r") as f:
-            status_dict = json.load(f)
-        docs = []
-        for fname, meta in status_dict.items():
-            if meta.get("company_id_slug") == company_id_slug:
-                docs.append({
-                    "filename": fname,
-                    "title": meta.get("title", fname),
-                    "company_id_slug": company_id_slug,
-                    "status": meta.get("status"),
-                    "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{fname}"
-                })
-        return jsonify({
-            "answer": f"You have {len(docs)} uploaded documents.",
-            "docs": docs,
-            "source": "company_docs"
-        })
+    if not check_rate_limit(tenant):
+        return jsonify({"error":"Too many requests, try again in a minute."}), 429
 
-    # Rate limit
-    if not check_rate_limit(company_id_slug):
-        return jsonify({"error": "Too many requests. Please wait a minute before asking again."}), 429
+    if is_vague(qtext):
+        return jsonify({"answer":"Can you give me more detail? E.g. which SOP or process you mean.","source":"clarify"})
 
-    # Brand personality
-    personality = COMPANY_PERSONALITY.get(company_id_slug, "")
-
-    # Off-topic queries
-    REDIRECT_TOPICS = [
-        "gmail", "outlook", "email password", "reset password",
-        "facebook", "amazon account", "personal bank"
-    ]
-    if any(t in user_query.lower() for t in REDIRECT_TOPICS):
-        return jsonify({
-            "answer": "Sorry, that question is outside of your company documents. For this type of issue, please contact your IT department or use the official help portal.",
-            "source": "redirect"
-        })
-
-    # Vague queries
-    if is_vague_query(user_query):
-        return jsonify({
-            "answer": "Could you provide a little more detail? (For example, specify which process or document you’re referring to.)",
-            "source": "clarify"
-        })
+    if any(t in qtext.lower() for t in ["gmail","facebook","amazon account"]):
+        return jsonify({"answer":"That’s outside your SOPs—please use the official help portal.","source":"off_topic"})
 
     try:
-        retriever = vectorstore.as_retriever(
-            search_kwargs={
-                "k": 3,
-                "filter": {"company_id_slug": company_id_slug}
-            }
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3, "filter": {"company_id_slug": tenant}})
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        qa = ConversationalRetrievalChain.from_llm(
+            ChatOpenAI(temperature=0),
+            retriever=retriever,
+            memory=memory
         )
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=ChatOpenAI(temperature=0, max_tokens=512),
-            chain_type="stuff",
-            retriever=retriever
-        )
-        sop_answer = qa_chain.invoke(user_query)
-        answer_text = sop_answer.get("result") if isinstance(sop_answer, dict) else str(sop_answer)
+        result = qa.invoke({"question": qtext})
+        answer = clean_text(result.get("answer", ""))
 
-        # Guardrails for sensitive info
-        if contains_sensitive(answer_text):
-            return jsonify({
-                "answer": "Sorry, this answer may contain sensitive or private information and can’t be provided by voice. Please contact your company admin for access.",
-                "source": "sensitive_guard"
-            })
+        if contains_sensitive(answer):
+            return jsonify({"answer":"Sorry, that info is private—please contact your admin.","source":"sensitive"})
 
-        # Quick summary for long answers
-        summary_msg = ""
-        if answer_text and len(answer_text.split()) > 50:
-            summary_msg = "Quick summary: " + " ".join(answer_text.split()[:30]) + "... Want more details? Just ask!"
-
-        # ---- Hybrid fallback logic ----
-        if is_unhelpful_answer(answer_text):
-            print(f"[FALLBACK] Fallback used for query: {user_query} | Company: {company_id_slug}")
-            llm = ChatOpenAI(temperature=0, max_tokens=256)
-            prompt = (
-                f"The company SOPs do not cover this. Please provide a friendly, helpful general business answer "
-                f"for this question: '{user_query}'"
+        if is_unhelpful_answer(answer):
+            fallback = ChatOpenAI(temperature=0).invoke(
+                f"Your company SOPs don’t cover this. Provide a helpful, business-best-practice response to: “{qtext}”"
             )
-            best_practice_answer = llm.invoke(prompt)
-            bp_text = best_practice_answer.content if hasattr(best_practice_answer, "content") else str(best_practice_answer)
+            fb_txt = clean_text(getattr(fallback, "content", str(fallback)))
             return jsonify({
-                "source": "general_best_practice",
+                "answer": f"{COMPANY_VOICES.get(tenant,'')} {fb_txt}",
                 "fallback_used": True,
-                "answer": f"{personality} {bp_text}\n\nIf you want more specifics, try rephrasing or uploading a document.",
-                "followups": generate_followups(user_query, bp_text)
+                "followups": generate_followups(qtext),
+                "source": "fallback"
             })
 
-        # Otherwise, return the SOP answer
-        response = {
-            "source": "sop",
+        return jsonify({
+            "answer": f"{COMPANY_VOICES.get(tenant,'')} {answer}",
             "fallback_used": False,
-            "answer": (personality + " " if personality else "") + (summary_msg + "\n" if summary_msg else "") + answer_text,
-            "followups": generate_followups(user_query, answer_text)
-        }
-        return jsonify(response)
+            "followups": generate_followups(qtext),
+            "source": "sop"
+        })
 
     except Exception as e:
-        print(f"[ERROR] Query failed: {e}")
         return jsonify({"error": "Query failed", "details": str(e)}), 500
 
-@app.route("/sop-status", methods=["GET"])
+def check_rate_limit(tenant: str) -> bool:
+    minute = int(time.time() // 60)
+    key = f"{tenant}-{minute}"
+    query_counts.setdefault(key, 0)
+    query_counts[key] += 1
+    return query_counts[key] <= RATE_LIMIT_MIN
+
+@app.route("/voice-reply", methods=["POST", "OPTIONS"])
+def voice_reply():
+    if request.method == "OPTIONS": return make_response(("", 204))
+    data = request.get_json() or {}
+    text = clean_text(data.get("query", ""))
+    if not text: return jsonify({"error": "Empty text"}), 400
+
+    tts_resp = requests.post(
+        "https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream",
+        headers={"xi-api-key": os.getenv("ELEVEN_API_KEY")},
+        json={"text": text}
+    )
+    return send_file(io.BytesIO(tts_resp.content), mimetype="audio/mpeg", download_name="reply.mp3")
+
+@app.route("/sop-status")
 def sop_status():
-    if os.path.exists(STATUS_FILE):
-        with open(STATUS_FILE, "r") as f:
-            return jsonify(json.load(f))
-    else:
-        return jsonify({})
+    if os.path.exists(STATUS_FILE): return send_file(STATUS_FILE)
+    return jsonify({})
 
 @app.route("/reload-db", methods=["POST"])
 def reload_db():
     load_vectorstore()
-    return jsonify({"message": "Vectorstore reloaded from disk."})
+    return jsonify({"message":"Vectorstore reloaded."})
 
-@app.route("/company-docs/<company_id_slug>", methods=["GET"])
+@app.route("/company-docs/<company_id_slug>")
 def company_docs(company_id_slug):
-    if not os.path.exists(STATUS_FILE):
-        return jsonify([])
-
-    with open(STATUS_FILE, "r") as f:
-        status_dict = json.load(f)
-
-    docs = []
-    for fname, meta in status_dict.items():
-        if meta.get("company_id_slug") == company_id_slug:
-            docs.append({
-                "filename": fname,
-                "title": meta.get("title", fname),
-                "company_id_slug": company_id_slug,
-                "status": meta.get("status"),
-                "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{fname}"
-            })
-
-    return jsonify(docs)
+    if not os.path.exists(STATUS_FILE): return jsonify([])
+    data = json.load(open(STATUS_FILE))
+    return jsonify([
+        {"filename":f, **m, "sop_file_url":f"{request.host_url}static/sop-files/{f}"}
+        for f,m in data.items() if m.get("company_id_slug")==company_id_slug
+    ])
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
