@@ -160,22 +160,22 @@ def upload_sop():
         return jsonify({"error": "File must be a .docx or .pdf"}), 400
 
     doc_title = request.form.get("doc_title") or file.filename
-    company_id = request.form.get("company_id") or "00000000-0000-0000-0000-000000000000"
+    company_id_slug = request.form.get("company_id_slug") or ""  # NEW: changed from company_id
 
     print(f"[UPLOAD] File: {file.filename}")
     print(f"[UPLOAD] Title: {doc_title}")
-    print(f"[UPLOAD] Company ID: {company_id}")
+    print(f"[UPLOAD] Company ID Slug: {company_id_slug}")
 
     save_path = os.path.join(SOP_FOLDER, file.filename)
     file.save(save_path)
 
     # ✅ Generate public file URL from static route
-    base_url = request.host_url.rstrip("/")  # Automatically picks up Render domain
+    base_url = request.host_url.rstrip("/")
     sop_file_url = f"{base_url}/static/sop-files/{file.filename}"
 
     metadata = {
         "title": doc_title,
-        "company_id": company_id,
+        "company_id_slug": company_id_slug,    # NEW: store in metadata for filtering
         "status": "embedding..."
     }
     update_status(file.filename, metadata)
@@ -185,25 +185,25 @@ def upload_sop():
     return jsonify({
         "message": f"File {file.filename} uploaded. Embedding in background.",
         "doc_title": doc_title,
-        "company_id": company_id,
+        "company_id_slug": company_id_slug,
         "sop_file_url": sop_file_url
     })
 
 # ---- Advanced /query endpoint ----
 # ---------------------------------
 query_counts = {}
-RATE_LIMIT_PER_MIN = 15  # e.g., 15 queries per company_id per minute
+RATE_LIMIT_PER_MIN = 15  # e.g., 15 queries per company_id_slug per minute
 
-def check_rate_limit(company_id):
+def check_rate_limit(company_id_slug):
     now = int(time.time() / 60)  # current minute as int
-    key = f"{company_id}-{now}"
+    key = f"{company_id_slug}-{now}"
     query_counts.setdefault(key, 0)
     query_counts[key] += 1
     return query_counts[key] <= RATE_LIMIT_PER_MIN
 
 COMPANY_PERSONALITY = {
-    "nzIvTy1QAd2bQvhs4d5Y": "Cades Market: Friendly, straightforward, local grocery expertise.",
-    # Add more company_id: "Brand personality/voice" here
+    "jaxdude-3057": "JaxDude: Straight to the point and helpful.",
+    # Add more company_id_slug: "Brand personality/voice" here
 }
 
 def contains_sensitive(text):
@@ -244,29 +244,28 @@ def query_sop():
 
     data = request.get_json()
     user_query = data.get("query", "")
-    company_id = data.get("company_id", "")
+    company_id_slug = data.get("company_id_slug", "")  # NEW: changed from company_id
 
-    if not user_query or not company_id:
-        return jsonify({"error": "Missing query or company_id"}), 400
+    if not user_query or not company_id_slug:
+        return jsonify({"error": "Missing query or company_id_slug"}), 400
 
     # 0. If user asks for list of documents, short-circuit to doc list!
     DOC_LIST_TRIGGERS = [
-        "what are my uploaded sops", "list my documents", "list uploaded docs", 
+        "what are my uploaded sops", "list my documents", "list uploaded docs",
         "list company documents", "show company docs", "what documents do i have"
     ]
     if user_query.strip().lower() in DOC_LIST_TRIGGERS:
-        # return document list for that company
         if not os.path.exists(STATUS_FILE):
             return jsonify({"docs": []})
         with open(STATUS_FILE, "r") as f:
             status_dict = json.load(f)
         docs = []
         for fname, meta in status_dict.items():
-            if meta.get("company_id") == company_id:
+            if meta.get("company_id_slug") == company_id_slug:
                 docs.append({
                     "filename": fname,
                     "title": meta.get("title", fname),
-                    "company_id": company_id,
+                    "company_id_slug": company_id_slug,
                     "status": meta.get("status"),
                     "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{fname}"
                 })
@@ -277,11 +276,11 @@ def query_sop():
         })
 
     # 1. Rate Limit
-    if not check_rate_limit(company_id):
+    if not check_rate_limit(company_id_slug):
         return jsonify({"error": "Too many requests. Please wait a minute before asking again."}), 429
 
     # 2. Company Brand Personality
-    personality = COMPANY_PERSONALITY.get(company_id, "")
+    personality = COMPANY_PERSONALITY.get(company_id_slug, "")
 
     # 3. Context-Aware Redirect (very off-topic queries)
     REDIRECT_TOPICS = ["gmail", "outlook", "email password", "reset password", "facebook", "amazon account", "personal bank"]
@@ -302,7 +301,7 @@ def query_sop():
         retriever = vectorstore.as_retriever(
             search_kwargs={
                 "k": 3,
-                "filter": {"company_id": company_id}
+                "filter": {"company_id_slug": company_id_slug}  # NEW: filter
             }
         )
         qa_chain = RetrievalQA.from_chain_type(
@@ -362,23 +361,23 @@ def reload_db():
     load_vectorstore()
     return jsonify({"message": "Vectorstore reloaded from disk."})
 
-@app.route("/company-docs/<company_id>", methods=["GET"])
-def company_docs(company_id):
+@app.route("/company-docs/<company_id_slug>", methods=["GET"])
+def company_docs(company_id_slug):
     # Get status.json mapping of file info
     if not os.path.exists(STATUS_FILE):
         return jsonify([])
 
     with open(STATUS_FILE, "r") as f:
         status_dict = json.load(f)
-    
-    # Filter files belonging to the requested company_id
+
+    # Filter files belonging to the requested company_id_slug
     docs = []
     for fname, meta in status_dict.items():
-        if meta.get("company_id") == company_id:
+        if meta.get("company_id_slug") == company_id_slug:
             docs.append({
                 "filename": fname,
                 "title": meta.get("title", fname),
-                "company_id": company_id,
+                "company_id_slug": company_id_slug,
                 "status": meta.get("status"),
                 "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{fname}"
             })
