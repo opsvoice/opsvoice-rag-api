@@ -89,6 +89,22 @@ def load_vectorstore():
 app = Flask(__name__)
 CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"])
 
+# ---- Utility: Detect unhelpful answer ----
+def is_unhelpful_answer(text):
+    """Detect if a RAG answer is blank, unhelpful, or clearly a fallback trigger."""
+    if not text or not text.strip():
+        return True
+    text_lower = text.lower().strip()
+    unhelpful_phrases = [
+        "don't know", "no information", "i'm not sure", "sorry", 
+        "i couldn't find", "not covered", "no relevant", "unavailable", "no answer"
+    ]
+    if any(phrase in text_lower for phrase in unhelpful_phrases):
+        return True
+    if len(text_lower.split()) < 6:
+        return True
+    return False
+
 # ---- Mobile Audio Endpoint for Voice Assistant ----
 @app.route('/voice-reply', methods=['POST', 'OPTIONS'])
 def voice_reply():
@@ -106,9 +122,9 @@ def voice_reply():
 
     # ElevenLabs API (always returns MP3 stream)
     el_resp = requests.post(
-        'https://api.elevenlabs.io/v1/text-to-speech/YOUR_VOICE_ID/stream',
+        'https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream',
         headers={
-            "xi-api-key": "YOUR_ELEVENLABS_API_KEY"
+            "xi-api-key": "sk_0b8e72ddb1dcb2092c83077f7d9d7a3c06c2cf0965a02df9"
         },
         json={
             "text": query_text
@@ -160,7 +176,7 @@ def upload_sop():
         return jsonify({"error": "File must be a .docx or .pdf"}), 400
 
     doc_title = request.form.get("doc_title") or file.filename
-    company_id_slug = request.form.get("company_id_slug") or ""  # NEW: changed from company_id
+    company_id_slug = request.form.get("company_id_slug") or ""
 
     print(f"[UPLOAD] File: {file.filename}")
     print(f"[UPLOAD] Title: {doc_title}")
@@ -169,13 +185,12 @@ def upload_sop():
     save_path = os.path.join(SOP_FOLDER, file.filename)
     file.save(save_path)
 
-    # ✅ Generate public file URL from static route
     base_url = request.host_url.rstrip("/")
     sop_file_url = f"{base_url}/static/sop-files/{file.filename}"
 
     metadata = {
         "title": doc_title,
-        "company_id_slug": company_id_slug,    # NEW: store in metadata for filtering
+        "company_id_slug": company_id_slug,
         "status": "embedding..."
     }
     update_status(file.filename, metadata)
@@ -189,13 +204,13 @@ def upload_sop():
         "sop_file_url": sop_file_url
     })
 
-# ---- Advanced /query endpoint ----
-# ---------------------------------
+# ---- Query endpoint with hybrid fallback ----
+
 query_counts = {}
-RATE_LIMIT_PER_MIN = 15  # e.g., 15 queries per company_id_slug per minute
+RATE_LIMIT_PER_MIN = 15
 
 def check_rate_limit(company_id_slug):
-    now = int(time.time() / 60)  # current minute as int
+    now = int(time.time() / 60)
     key = f"{company_id_slug}-{now}"
     query_counts.setdefault(key, 0)
     query_counts[key] += 1
@@ -210,12 +225,12 @@ def contains_sensitive(text):
     if not text:
         return False
     patterns = [
-        r"\bssn\b|\bsocial security\b|\b\d{3}-\d{2}-\d{4}\b",         # SSN
-        r"\b\d{5,}\b",                                                # suspicious long numbers
-        r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",                         # phone numbers
-        r"\$[\d,]+(\.\d{2})?",                                        # dollar amounts
-        r"\bsalary\b|\bwage\b|\bcompensation\b",                      # salary/wage terms
-        r"\bemail\b|\b@\w+\.\w+\b",                                   # emails
+        r"\bssn\b|\bsocial security\b|\b\d{3}-\d{2}-\d{4}\b",
+        r"\b\d{5,}\b",
+        r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+        r"\$[\d,]+(\.\d{2})?",
+        r"\bsalary\b|\bwage\b|\bcompensation\b",
+        r"\bemail\b|\b@\w+\.\w+\b",
     ]
     combined = "|".join(patterns)
     return bool(re.search(combined, text, re.IGNORECASE))
@@ -244,12 +259,12 @@ def query_sop():
 
     data = request.get_json()
     user_query = data.get("query", "")
-    company_id_slug = data.get("company_id_slug", "")  # NEW: changed from company_id
+    company_id_slug = data.get("company_id_slug", "")
 
     if not user_query or not company_id_slug:
         return jsonify({"error": "Missing query or company_id_slug"}), 400
 
-    # 0. If user asks for list of documents, short-circuit to doc list!
+    # Doc list shortcut
     DOC_LIST_TRIGGERS = [
         "what are my uploaded sops", "list my documents", "list uploaded docs",
         "list company documents", "show company docs", "what documents do i have"
@@ -275,22 +290,25 @@ def query_sop():
             "source": "company_docs"
         })
 
-    # 1. Rate Limit
+    # Rate limit
     if not check_rate_limit(company_id_slug):
         return jsonify({"error": "Too many requests. Please wait a minute before asking again."}), 429
 
-    # 2. Company Brand Personality
+    # Brand personality
     personality = COMPANY_PERSONALITY.get(company_id_slug, "")
 
-    # 3. Context-Aware Redirect (very off-topic queries)
-    REDIRECT_TOPICS = ["gmail", "outlook", "email password", "reset password", "facebook", "amazon account", "personal bank"]
+    # Off-topic queries
+    REDIRECT_TOPICS = [
+        "gmail", "outlook", "email password", "reset password",
+        "facebook", "amazon account", "personal bank"
+    ]
     if any(t in user_query.lower() for t in REDIRECT_TOPICS):
         return jsonify({
             "answer": "Sorry, that question is outside of your company documents. For this type of issue, please contact your IT department or use the official help portal.",
             "source": "redirect"
         })
 
-    # 4. Clarity Prompt
+    # Vague queries
     if is_vague_query(user_query):
         return jsonify({
             "answer": "Could you provide a little more detail? (For example, specify which process or document you’re referring to.)",
@@ -301,7 +319,7 @@ def query_sop():
         retriever = vectorstore.as_retriever(
             search_kwargs={
                 "k": 3,
-                "filter": {"company_id_slug": company_id_slug}  # NEW: filter
+                "filter": {"company_id_slug": company_id_slug}
             }
         )
         qa_chain = RetrievalQA.from_chain_type(
@@ -312,33 +330,39 @@ def query_sop():
         sop_answer = qa_chain.invoke(user_query)
         answer_text = sop_answer.get("result") if isinstance(sop_answer, dict) else str(sop_answer)
 
-        # 5. Sensitive Guardrails
+        # Guardrails for sensitive info
         if contains_sensitive(answer_text):
             return jsonify({
                 "answer": "Sorry, this answer may contain sensitive or private information and can’t be provided by voice. Please contact your company admin for access.",
                 "source": "sensitive_guard"
             })
 
-        # 6. Quick Summary
+        # Quick summary for long answers
         summary_msg = ""
         if answer_text and len(answer_text.split()) > 50:
             summary_msg = "Quick summary: " + " ".join(answer_text.split()[:30]) + "... Want more details? Just ask!"
 
-        # 7. Best Practices Fallback
-        if not answer_text or "don't know" in answer_text.lower() or "no information" in answer_text.lower():
+        # ---- Hybrid fallback logic ----
+        if is_unhelpful_answer(answer_text):
+            print(f"[FALLBACK] Fallback used for query: {user_query} | Company: {company_id_slug}")
             llm = ChatOpenAI(temperature=0, max_tokens=256)
-            prompt = f"The company SOPs do not cover this. Please provide a general business best practice for: {user_query}"
+            prompt = (
+                f"The company SOPs do not cover this. Please provide a friendly, helpful general business answer "
+                f"for this question: '{user_query}'"
+            )
             best_practice_answer = llm.invoke(prompt)
             bp_text = best_practice_answer.content if hasattr(best_practice_answer, "content") else str(best_practice_answer)
             return jsonify({
                 "source": "general_best_practice",
-                "answer": f"{personality} A general best practice is: {bp_text}\n\nIf you want more specifics, try rephrasing or uploading a document.",
+                "fallback_used": True,
+                "answer": f"{personality} {bp_text}\n\nIf you want more specifics, try rephrasing or uploading a document.",
                 "followups": generate_followups(user_query, bp_text)
             })
 
-        # 8. Brand Personality + Summary + Followup Suggestions
+        # Otherwise, return the SOP answer
         response = {
             "source": "sop",
+            "fallback_used": False,
             "answer": (personality + " " if personality else "") + (summary_msg + "\n" if summary_msg else "") + answer_text,
             "followups": generate_followups(user_query, answer_text)
         }
@@ -363,14 +387,12 @@ def reload_db():
 
 @app.route("/company-docs/<company_id_slug>", methods=["GET"])
 def company_docs(company_id_slug):
-    # Get status.json mapping of file info
     if not os.path.exists(STATUS_FILE):
         return jsonify([])
 
     with open(STATUS_FILE, "r") as f:
         status_dict = json.load(f)
 
-    # Filter files belonging to the requested company_id_slug
     docs = []
     for fname, meta in status_dict.items():
         if meta.get("company_id_slug") == company_id_slug:
