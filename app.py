@@ -54,171 +54,324 @@ def add_cors(response):
 
 # ---- Utility Functions ----
 def clean_text(txt: str) -> str:
-    txt = re.sub(r"\s+", " ", txt or "")
-    return txt.replace("\u2022", "-").replace("\t", " ").strip()
+    """Clean text for TTS - remove problematic characters"""
+    if not txt:
+        return ""
+    txt = re.sub(r"\s+", " ", txt)
+    txt = txt.replace("\u2022", "-").replace("\t", " ")
+    txt = re.sub(r"[*#]+", "", txt)  # Remove markdown
+    txt = re.sub(r"\[.*?\]", "", txt)  # Remove brackets
+    txt = txt.strip()
+    return txt
 
 def is_unhelpful_answer(text):
-    if not text or not text.strip(): return True
+    """Check if answer is too generic or unhelpful"""
+    if not text or not text.strip(): 
+        return True
     low = text.lower()
     triggers = ["don't know", "no information", "i'm not sure", "sorry", "unavailable", "not covered"]
     return any(t in low for t in triggers) or len(low.split()) < 6
 
 def contains_sensitive(text):
-    patterns = [r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}", r"$\d+[\,\d]*(\.\d\d)?"]
+    """Check for sensitive information that shouldn't be exposed"""
+    if not text:
+        return False
+    patterns = [
+        r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}",  # SSN
+        r"\$\d+[\,\d]*(\.\d\d)?",  # Dollar amounts
+        r"\b\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\b",  # Credit card numbers
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"  # Email addresses
+    ]
     return bool(re.search("|".join(patterns), text, re.IGNORECASE))
 
-def generate_followups(q):
+def generate_followups(query):
+    """Generate contextual follow-up questions"""
     base = ["Do you want to know more details?", "Would you like steps for a related task?", "Need help finding a specific document?"]
-    q = q.lower()
-    if "invoice" in q: base.insert(0, "Do you want steps to send an invoice?")
-    if "onboard" in q or "hire" in q: base.insert(0, "Want to know about new-hire paperwork?")
+    q = query.lower()
+    if "invoice" in q: 
+        base.insert(0, "Do you want steps to send an invoice?")
+    if "onboard" in q or "hire" in q: 
+        base.insert(0, "Want to know about new-hire paperwork?")
+    if "procedure" in q:
+        base.insert(0, "Need the complete procedure checklist?")
     return base[:3]
 
-def is_vague(query): return len(query.split()) < 3 or not query.strip().endswith("?")
+def is_vague(query): 
+    """Check if query needs clarification"""
+    return len(query.split()) < 3 or not query.strip().endswith("?")
 
 # ---- Embedding Worker ----
 def embed_sop_worker(fpath, metadata=None):
+    """Background worker to embed documents"""
     fname = os.path.basename(fpath)
     try:
         ext = fname.rsplit(".", 1)[-1].lower()
-        docs = UnstructuredWordDocumentLoader(fpath).load() if ext == "docx" else PyPDFLoader(fpath).load()
-        chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100).split_documents(docs)
-        for c in chunks: c.metadata.update(metadata or {})
+        if ext == "docx":
+            docs = UnstructuredWordDocumentLoader(fpath).load()
+        elif ext == "pdf":
+            docs = PyPDFLoader(fpath).load()
+        else:
+            raise ValueError(f"Unsupported file type: {ext}")
+            
+        chunks = RecursiveCharacterTextSplitter(
+            chunk_size=500, 
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        ).split_documents(docs)
+        
+        # Add metadata to all chunks
+        for c in chunks: 
+            c.metadata.update(metadata or {})
+            
         db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
         db.add_documents(chunks)
         db.persist()
+        print(f"[EMBED] Successfully embedded {fname}")
         update_status(fname, {"status": "embedded", **(metadata or {})})
     except Exception as e:
-        update_status(fname, {"status": f"error: {e}", **(metadata or {})})
+        print(f"[EMBED] Error with {fname}: {e}")
+        update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
 
 def update_status(filename, status):
+    """Update document processing status"""
     try:
         data = json.load(open(STATUS_FILE)) if os.path.exists(STATUS_FILE) else {}
-        data[filename] = status
-        with open(STATUS_FILE, "w") as f: json.dump(data, f, indent=2)
+        data[filename] = {**status, "updated_at": time.time()}
+        with open(STATUS_FILE, "w") as f: 
+            json.dump(data, f, indent=2)
+        print(f"[STATUS] Updated {filename}: {status.get('status', 'unknown')}")
     except Exception as e:
-        print(f"[STATUS] Error: {e}")
+        print(f"[STATUS] Error updating {filename}: {e}")
 
 def load_vectorstore():
+    """Load the vector database"""
     global vectorstore
-    vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+    try:
+        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+        print("[DB] Vector store loaded successfully")
+    except Exception as e:
+        print(f"[DB] Error loading vector store: {e}")
 
 # ---- Routes ----
 @app.route("/")
-def home(): return "🚀 OpsVoice RAG API is live!"
+def home(): 
+    return jsonify({
+        "status": "ok", 
+        "message": "🚀 OpsVoice RAG API is live!",
+        "version": "1.0.0"
+    })
 
 @app.route("/healthz")
-def healthz(): return jsonify({"status": "ok"})
+def healthz(): 
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time(),
+        "vectorstore": "loaded" if vectorstore else "not_loaded"
+    })
 
 @app.route("/list-sops")
 def list_sops():
+    """List all uploaded SOP files"""
     docs = glob.glob(os.path.join(SOP_FOLDER, "*.docx")) + glob.glob(os.path.join(SOP_FOLDER, "*.pdf"))
-    return jsonify(docs)
+    return jsonify({"files": docs, "count": len(docs)})
 
 @app.route("/static/sop-files/<path:filename>")
-def serve_sop(filename): return send_from_directory(SOP_FOLDER, filename)
+def serve_sop(filename): 
+    """Serve SOP files"""
+    return send_from_directory(SOP_FOLDER, filename)
 
 @app.route("/upload-sop", methods=["POST"])
 def upload_sop():
+    """Upload and process SOP documents"""
     file = request.files.get("file")
-    if not file or not file.filename: return jsonify({"error":"No file uploaded"}), 400
-    ext = file.filename.rsplit(".",1)[-1].lower()
-    if ext not in ("docx","pdf"): return jsonify({"error":"Only .docx/.pdf allowed"}), 400
+    if not file or not file.filename: 
+        return jsonify({"error": "No file uploaded"}), 400
+        
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ("docx", "pdf"): 
+        return jsonify({"error": "Only .docx and .pdf files allowed"}), 400
 
+    # Get metadata
     tenant = re.sub(r"[^\w\-]", "", request.form.get("company_id_slug", ""))
     title = request.form.get("doc_title", file.filename)
-    save_p = os.path.join(SOP_FOLDER, file.filename)
-    file.save(save_p)
+    
+    if not tenant:
+        return jsonify({"error": "company_id_slug is required"}), 400
+        
+    # Check file size (10MB limit)
+    file.seek(0, 2)  # Seek to end
+    size = file.tell()
+    file.seek(0)  # Reset
+    if size > 10 * 1024 * 1024:  # 10MB
+        return jsonify({"error": "File too large (max 10MB)"}), 400
 
-    meta = {"title": title, "company_id_slug": tenant}
-    update_status(file.filename, {"status":"embedding...", **meta})
-    Thread(target=embed_sop_worker, args=(save_p, meta), daemon=True).start()
+    # Save file
+    safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', file.filename)
+    save_path = os.path.join(SOP_FOLDER, safe_filename)
+    file.save(save_path)
+
+    # Prepare metadata
+    metadata = {
+        "title": title,
+        "company_id_slug": tenant,
+        "filename": safe_filename,
+        "uploaded_at": time.time()
+    }
+    
+    # Start background embedding
+    update_status(safe_filename, {"status": "embedding...", **metadata})
+    Thread(target=embed_sop_worker, args=(save_path, metadata), daemon=True).start()
 
     return jsonify({
-        "message": f"Uploaded {file.filename}, embedding in background.",
+        "message": f"Uploaded {safe_filename}, embedding in background.",
         "doc_title": title,
         "company_id_slug": tenant,
-        "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{file.filename}"
+        "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{safe_filename}"
     })
 
+# Rate limiting
 query_counts = {}
 RATE_LIMIT_MIN = 15
+
+def check_rate_limit(tenant: str) -> bool:
+    """Check if tenant is within rate limits"""
+    minute = int(time.time() // 60)
+    key = f"{tenant}-{minute}"
+    query_counts.setdefault(key, 0)
+    query_counts[key] += 1
+    
+    # Clean old entries
+    current_keys = [k for k in query_counts.keys() if k.startswith(f"{tenant}-")]
+    for k in current_keys:
+        if int(k.split("-")[1]) < minute - 5:  # Keep last 5 minutes
+            del query_counts[k]
+    
+    return query_counts[key] <= RATE_LIMIT_MIN
+
+# Company voice settings
 COMPANY_VOICES = {
-    "jaxdude-3057": "JaxDude: Straight to the point and helpful."
+    "chelco-3153": "Chelco Assistant: Professional and helpful.",
+    "demo_company_123": "Demo Assistant: Here to help with your questions."
 }
 
 @app.route("/query", methods=["POST"])
 def query_sop():
+    """Query documents using RAG"""
     global vectorstore
-    if vectorstore is None: load_vectorstore()
+    if vectorstore is None: 
+        load_vectorstore()
 
     payload = request.get_json() or {}
     qtext = clean_text(payload.get("query", ""))
     tenant = re.sub(r"[^\w\-]", "", payload.get("company_id_slug", ""))
 
     if not qtext or not tenant:
-        return jsonify({"error":"Missing query or tenant"}), 400
+        return jsonify({"error": "Missing query or company_id_slug"}), 400
 
+    # Rate limiting
     if not check_rate_limit(tenant):
-        return jsonify({"error":"Too many requests, try again in a minute."}), 429
+        return jsonify({"error": "Too many requests, try again in a minute."}), 429
 
+    # Check for vague queries
     if is_vague(qtext):
-        return jsonify({"answer":"Can you give me more detail—like the specific SOP or process you’re referring to?","source":"clarify"})
+        return jsonify({
+            "answer": "Can you give me more detail—like the specific SOP or process you're referring to?",
+            "source": "clarify"
+        })
 
-    if any(t in qtext.lower() for t in ["gmail","facebook","amazon account"]):
-        return jsonify({"answer":"That’s outside your SOPs—please use the official help portal.","source":"off_topic"})
+    # Filter out off-topic queries
+    off_topic_keywords = ["gmail", "facebook", "amazon account", "weather", "news", "stock price"]
+    if any(keyword in qtext.lower() for keyword in off_topic_keywords):
+        return jsonify({
+            "answer": "That's outside your company SOPs—please use the official help portal or ask about your internal procedures.",
+            "source": "off_topic"
+        })
 
     try:
+        # Set up retriever with company filtering
         retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 5, "filter": {"company_id_slug": tenant}, "score_threshold": 0.5}
+            search_kwargs={
+                "k": 5, 
+                "filter": {"company_id_slug": tenant}
+            }
         )
-        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        
+        # Create conversational chain
+        memory = ConversationBufferMemory(
+            memory_key="chat_history", 
+            return_messages=True,
+            output_key="answer"
+        )
+        
         qa = ConversationalRetrievalChain.from_llm(
-            ChatOpenAI(temperature=0),
+            ChatOpenAI(temperature=0, model="gpt-4"),
             retriever=retriever,
-            memory=memory
+            memory=memory,
+            return_source_documents=True
         )
+        
+        # Query the chain
         result = qa.invoke({"question": qtext})
         answer = clean_text(result.get("answer", ""))
 
+        # Security check
         if contains_sensitive(answer):
-            return jsonify({"answer":"Sorry, that info is private—please contact your admin.","source":"sensitive"})
-
-        if is_unhelpful_answer(answer):
-            fallback = ChatOpenAI(temperature=0).invoke(
-                f"Your company SOPs don’t cover this. Provide a helpful, business-best-practice response to: “{qtext}”"
-            )
-            fb_txt = clean_text(getattr(fallback, "content", str(fallback)))
             return jsonify({
-                "answer": f"{COMPANY_VOICES.get(tenant,'')} {fb_txt}",
-                "fallback_used": True,
-                "followups": generate_followups(qtext),
-                "source": "fallback"
+                "answer": "Sorry, that information contains sensitive data—please contact your admin directly.",
+                "source": "sensitive"
             })
 
-        if len(answer.split()) > 100:
-            answer = "Let me give you a short summary. " + " ".join(answer.split()[:50]) + "..."
+        # Check if answer is helpful
+        if is_unhelpful_answer(answer):
+            # Fallback to general business knowledge
+            try:
+                fallback_prompt = f"""
+                The user asked: "{qtext}"
+                
+                Their company SOPs don't cover this topic. Provide a helpful, professional business response 
+                that gives general best practices or guidance. Keep it concise and actionable.
+                """
+                
+                fallback = ChatOpenAI(temperature=0.3).invoke(fallback_prompt)
+                fallback_text = clean_text(getattr(fallback, "content", str(fallback)))
+                
+                company_voice = COMPANY_VOICES.get(tenant, "")
+                
+                return jsonify({
+                    "answer": f"{company_voice} {fallback_text}",
+                    "fallback_used": True,
+                    "followups": generate_followups(qtext),
+                    "source": "fallback"
+                })
+            except Exception as e:
+                print(f"[FALLBACK] Error: {e}")
+                return jsonify({
+                    "answer": "I don't have specific information about that in your SOPs. Could you try asking about a different topic or contact your admin?",
+                    "source": "no_info"
+                })
 
+        # Truncate long answers for TTS
+        if len(answer.split()) > 80:
+            answer = "Here's a summary: " + " ".join(answer.split()[:70]) + "... For complete details, check your SOPs."
+
+        company_voice = COMPANY_VOICES.get(tenant, "")
+        
         return jsonify({
-            "answer": f"{COMPANY_VOICES.get(tenant,'')} {answer}",
+            "answer": f"{company_voice} {answer}",
             "fallback_used": False,
             "followups": generate_followups(qtext),
-            "source": "sop"
+            "source": "sop",
+            "source_documents": len(result.get("source_documents", []))
         })
 
     except Exception as e:
+        print(f"[QUERY] Error: {e}")
         return jsonify({"error": "Query failed", "details": str(e)}), 500
-
-def check_rate_limit(tenant: str) -> bool:
-    minute = int(time.time() // 60)
-    key = f"{tenant}-{minute}"
-    query_counts.setdefault(key, 0)
-    query_counts[key] += 1
-    return query_counts[key] <= RATE_LIMIT_MIN
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
 def voice_reply():
-    # 🔧 CORS preflight response
+    """Convert text to speech for voice responses"""
+    # Handle CORS preflight
     if request.method == "OPTIONS":
         response = make_response()
         response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "")
@@ -228,69 +381,151 @@ def voice_reply():
 
     data = request.get_json() or {}
     text = clean_text(data.get("query", ""))
-    if not text: return jsonify({"error": "Empty text"}), 400
+    
+    if not text: 
+        return jsonify({"error": "Empty text"}), 400
 
-    # 🔧 Generate cache key
+    # Generate cache key
     tenant = re.sub(r"[^\w\-]", "", data.get("company_id_slug", ""))
     cache_key = f"{tenant}_{hash(text)}.mp3"
     cache_path = os.path.join(AUDIO_CACHE_DIR, cache_key)
 
     # Serve from cache if available
     if os.path.exists(cache_path):
+        print(f"[TTS] Serving cached audio: {cache_key}")
         return send_file(cache_path, mimetype="audio/mp3", as_attachment=False)
 
-    # Generate new audio if not cached
+    # Generate new audio
     try:
+        # Limit text length for TTS
+        tts_text = text[:500] if len(text) > 500 else text
+        
+        print(f"[TTS] Generating audio for: {tts_text[:50]}...")
+        
         tts_resp = requests.post(
             "https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream",
-            headers={"xi-api-key": os.getenv("sk_0b8e72ddb1dcb2092c83077f7d9d7a3c06c2cf0965a02df9")},
-            json={"text": text}
+            headers={
+                "xi-api-key": os.getenv("ELEVENLABS_API_KEY"),
+                "Content-Type": "application/json"
+            },
+            json={
+                "text": tts_text,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                    "style": 0.0,
+                    "use_speaker_boost": True
+                }
+            },
+            timeout=30
         )
+        
         if tts_resp.status_code != 200:
-            return jsonify({"error": "TTS service unavailable"}), 502
+            print(f"[TTS] ElevenLabs error: {tts_resp.status_code} - {tts_resp.text}")
+            return jsonify({"error": "TTS service error"}), 502
 
-        # 🔧 Cache audio
+        # Cache the audio
+        audio_data = tts_resp.content
         with open(cache_path, "wb") as f:
-            f.write(tts_resp.content)
+            f.write(audio_data)
+        
+        print(f"[TTS] Generated and cached: {cache_key}")
+        return send_file(io.BytesIO(audio_data), mimetype="audio/mp3", as_attachment=False)
 
-        return send_file(io.BytesIO(tts_resp.content), mimetype="audio/mp3", as_attachment=False)
-
+    except requests.exceptions.Timeout:
+        print("[TTS] Request timeout")
+        return jsonify({"error": "TTS request timeout"}), 504
     except Exception as e:
+        print(f"[TTS] Error: {e}")
         return jsonify({"error": "TTS request failed", "details": str(e)}), 500
 
 @app.route("/sop-status")
 def sop_status():
-    if os.path.exists(STATUS_FILE): return send_file(STATUS_FILE)
+    """Get document processing status"""
+    if os.path.exists(STATUS_FILE): 
+        return send_file(STATUS_FILE)
     return jsonify({})
+
+@app.route("/company-docs/<company_id_slug>")
+def company_docs(company_id_slug):
+    """Get documents for a specific company"""
+    if not os.path.exists(STATUS_FILE): 
+        return jsonify([])
+    
+    try:
+        data = json.load(open(STATUS_FILE))
+        company_docs = []
+        
+        for filename, metadata in data.items():
+            if metadata.get("company_id_slug") == company_id_slug:
+                doc_info = {
+                    "filename": filename,
+                    "title": metadata.get("title", filename),
+                    "status": metadata.get("status", "unknown"),
+                    "company_id_slug": company_id_slug,
+                    "uploaded_at": metadata.get("uploaded_at"),
+                    "sop_file_url": f"{request.host_url}static/sop-files/{filename}"
+                }
+                company_docs.append(doc_info)
+        
+        print(f"[DOCS] Found {len(company_docs)} documents for {company_id_slug}")
+        return jsonify(company_docs)
+        
+    except Exception as e:
+        print(f"[DOCS] Error: {e}")
+        return jsonify({"error": "Failed to fetch documents"}), 500
 
 @app.route("/lookup-slug")
 def lookup_slug():
+    """Lookup company slug by email"""
     email = request.args.get("email", "").strip().lower()
     if not email or not os.path.exists(STATUS_FILE):
         return jsonify({"error": "Invalid email or missing status"}), 400
 
-    data = json.load(open(STATUS_FILE))
-    for meta in data.values():
-        if meta.get("uploaded_by", "").strip().lower() == email:
-            return jsonify({"slug": meta.get("company_id_slug")})
-
-    return jsonify({"error": "Not found"}), 404
+    try:
+        data = json.load(open(STATUS_FILE))
+        for metadata in data.values():
+            if metadata.get("uploaded_by", "").strip().lower() == email:
+                return jsonify({"slug": metadata.get("company_id_slug")})
+        
+        return jsonify({"error": "Not found"}), 404
+    except Exception as e:
+        print(f"[LOOKUP] Error: {e}")
+        return jsonify({"error": "Lookup failed"}), 500
 
 @app.route("/reload-db", methods=["POST"])
 def reload_db():
+    """Reload the vector database"""
     load_vectorstore()
-    return jsonify({"message":"Vectorstore reloaded."})
+    return jsonify({"message": "Vectorstore reloaded successfully."})
 
-@app.route("/company-docs/")
-def company_docs(company_id_slug):
-    if not os.path.exists(STATUS_FILE): return jsonify([])
-    data = json.load(open(STATUS_FILE))
-    return jsonify([
-        {"filename":f, **m, "sop_file_url":f"{request.host_url}static/sop-files/{f}"}
-        for f,m in data.items() if m.get("company_id_slug")==company_id_slug
-    ])
+@app.route("/clear-cache", methods=["POST"])
+def clear_cache():
+    """Clear audio cache"""
+    try:
+        if os.path.exists(AUDIO_CACHE_DIR):
+            for filename in os.listdir(AUDIO_CACHE_DIR):
+                if filename.endswith('.mp3'):
+                    os.remove(os.path.join(AUDIO_CACHE_DIR, filename))
+        return jsonify({"message": "Audio cache cleared"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    
+    # Load vectorstore on startup
+    print("[STARTUP] Loading vector store...")
     load_vectorstore()
-    app.run(host="0.0.0.0", port=port)
+    
+    print(f"[STARTUP] Starting OpsVoice API on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
