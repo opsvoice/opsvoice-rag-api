@@ -1,9 +1,6 @@
-# Updated app.py with optimizations and fixes (except #4 memory persistence)
-
 from flask import Flask, request, jsonify, send_from_directory, send_file, make_response
 import os, glob, json, re, time, io, shutil, requests
 from dotenv import load_dotenv
-load_dotenv()
 from threading import Thread
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -13,14 +10,18 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from flask_cors import CORS
 
+load_dotenv()
+
 # ---- Paths & Setup ----
-DATA_PATH    = "/data"
-SOP_FOLDER   = os.path.join(DATA_PATH, "sop-files")
-CHROMA_DIR   = os.path.join(DATA_PATH, "chroma_db")
-STATUS_FILE  = os.path.join(SOP_FOLDER, "status.json")
+DATA_PATH = "/data"
+SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
+CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
+AUDIO_CACHE_DIR = os.path.join(DATA_PATH, "audio_cache")
+STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
 
 os.makedirs(SOP_FOLDER, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 # Clean Chroma on startup
 if os.path.exists(CHROMA_DIR):
@@ -36,16 +37,22 @@ vectorstore = None
 
 # ---- Flask Setup ----
 app = Flask(__name__)
-CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"])
+# ✅ Allow specific origins with credentials
+CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"], supports_credentials=True)
 
 @app.after_request
 def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    # 🔧 Dynamically set origin from request headers
+    origin = request.headers.get("Origin", "")
+    allowed_origins = ["https://opsvoice-widget.vercel.app", "http://localhost:3000"]
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
-# ---- Text Utilities ----
+# ---- Utility Functions ----
 def clean_text(txt: str) -> str:
     txt = re.sub(r"\s+", " ", txt or "")
     return txt.replace("\u2022", "-").replace("\t", " ").strip()
@@ -57,7 +64,7 @@ def is_unhelpful_answer(text):
     return any(t in low for t in triggers) or len(low.split()) < 6
 
 def contains_sensitive(text):
-    patterns = [r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}", r"\$\d+[\,\d]*(\.\d\d)?"]
+    patterns = [r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}", r"$\d+[\,\d]*(\.\d\d)?"]
     return bool(re.search("|".join(patterns), text, re.IGNORECASE))
 
 def generate_followups(q):
@@ -98,7 +105,7 @@ def load_vectorstore():
 
 # ---- Routes ----
 @app.route("/")
-def home(): return "\U0001F680 OpsVoice RAG API is live!"
+def home(): return "🚀 OpsVoice RAG API is live!"
 
 @app.route("/healthz")
 def healthz(): return jsonify({"status": "ok"})
@@ -118,7 +125,7 @@ def upload_sop():
     ext = file.filename.rsplit(".",1)[-1].lower()
     if ext not in ("docx","pdf"): return jsonify({"error":"Only .docx/.pdf allowed"}), 400
 
-    tenant = request.form.get("company_id_slug", "")
+    tenant = re.sub(r"[^\w\-]", "", request.form.get("company_id_slug", ""))
     title = request.form.get("doc_title", file.filename)
     save_p = os.path.join(SOP_FOLDER, file.filename)
     file.save(save_p)
@@ -147,7 +154,7 @@ def query_sop():
 
     payload = request.get_json() or {}
     qtext = clean_text(payload.get("query", ""))
-    tenant = payload.get("company_id_slug", "")
+    tenant = re.sub(r"[^\w\-]", "", payload.get("company_id_slug", ""))
 
     if not qtext or not tenant:
         return jsonify({"error":"Missing query or tenant"}), 400
@@ -211,17 +218,45 @@ def check_rate_limit(tenant: str) -> bool:
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
 def voice_reply():
-    if request.method == "OPTIONS": return make_response(("", 204))
+    # 🔧 CORS preflight response
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "")
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return response
+
     data = request.get_json() or {}
     text = clean_text(data.get("query", ""))
     if not text: return jsonify({"error": "Empty text"}), 400
 
-    tts_resp = requests.post(
-        "https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream",
-        headers={"xi-api-key": os.getenv("ELEVEN_API_KEY")},
-        json={"text": text}
-    )
-    return send_file(io.BytesIO(tts_resp.content), mimetype="audio/mpeg", download_name="reply.mp3")
+    # 🔧 Generate cache key
+    tenant = re.sub(r"[^\w\-]", "", data.get("company_id_slug", ""))
+    cache_key = f"{tenant}_{hash(text)}.mp3"
+    cache_path = os.path.join(AUDIO_CACHE_DIR, cache_key)
+
+    # Serve from cache if available
+    if os.path.exists(cache_path):
+        return send_file(cache_path, mimetype="audio/mp3", as_attachment=False)
+
+    # Generate new audio if not cached
+    try:
+        tts_resp = requests.post(
+            "https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream",
+            headers={"xi-api-key": os.getenv("sk_0b8e72ddb1dcb2092c83077f7d9d7a3c06c2cf0965a02df9")},
+            json={"text": text}
+        )
+        if tts_resp.status_code != 200:
+            return jsonify({"error": "TTS service unavailable"}), 502
+
+        # 🔧 Cache audio
+        with open(cache_path, "wb") as f:
+            f.write(tts_resp.content)
+
+        return send_file(io.BytesIO(tts_resp.content), mimetype="audio/mp3", as_attachment=False)
+
+    except Exception as e:
+        return jsonify({"error": "TTS request failed", "details": str(e)}), 500
 
 @app.route("/sop-status")
 def sop_status():
@@ -241,13 +276,12 @@ def lookup_slug():
 
     return jsonify({"error": "Not found"}), 404
 
-
 @app.route("/reload-db", methods=["POST"])
 def reload_db():
     load_vectorstore()
     return jsonify({"message":"Vectorstore reloaded."})
 
-@app.route("/company-docs/<company_id_slug>")
+@app.route("/company-docs/")
 def company_docs(company_id_slug):
     if not os.path.exists(STATUS_FILE): return jsonify([])
     data = json.load(open(STATUS_FILE))
