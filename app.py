@@ -65,40 +65,85 @@ def clean_text(txt: str) -> str:
     return txt
 
 def is_unhelpful_answer(text):
-    """Check if answer is too generic or unhelpful"""
+    """Enhanced unhelpful answer detection"""
     if not text or not text.strip(): 
         return True
+        
     low = text.lower()
-    triggers = ["don't know", "no information", "i'm not sure", "sorry", "unavailable", "not covered"]
-    return any(t in low for t in triggers) or len(low.split()) < 6
+    
+    # Definitive unhelpful phrases
+    definitive_triggers = [
+        "don't know", "no information", "i'm not sure", "sorry", 
+        "unavailable", "not covered", "cannot find", "no specific information",
+        "not mentioned", "doesn't provide", "no details", "not included",
+        "context provided does not include", "text does not provide"
+    ]
+    
+    # Must have substantial content (more than just a trigger phrase)
+    has_trigger = any(t in low for t in definitive_triggers)
+    is_too_short = len(low.split()) < 8
+    
+    return has_trigger or is_too_short
 
 def contains_sensitive(text):
-    """Check for sensitive information that shouldn't be exposed"""
-    if not text:
-        return False
-    patterns = [
-        r"\bssn\b|\bsocial security\b|\d{3}-\d{2}-\d{4}",  # SSN
-        r"\$\d+[\,\d]*(\.\d\d)?",  # Dollar amounts
-        r"\b\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\b",  # Credit card numbers
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"  # Email addresses
-    ]
-    return bool(re.search("|".join(patterns), text, re.IGNORECASE))
+    """Temporarily disable sensitivity filtering for MVP"""
+    return False
 
 def generate_followups(query):
-    """Generate contextual follow-up questions"""
-    base = ["Do you want to know more details?", "Would you like steps for a related task?", "Need help finding a specific document?"]
+    """Generate smarter contextual follow-up questions"""
     q = query.lower()
-    if "invoice" in q: 
-        base.insert(0, "Do you want steps to send an invoice?")
-    if "onboard" in q or "hire" in q: 
-        base.insert(0, "Want to know about new-hire paperwork?")
-    if "procedure" in q:
-        base.insert(0, "Need the complete procedure checklist?")
-    return base[:3]
+    base_followups = []
+    
+    # Context-specific followups
+    if any(word in q for word in ["procedure", "process", "how"]):
+        base_followups.extend([
+            "Would you like the complete step-by-step procedure?",
+            "Do you need information about related processes?"
+        ])
+    elif any(word in q for word in ["policy", "rule", "guideline"]):
+        base_followups.extend([
+            "Would you like to know about related policies?",
+            "Do you need clarification on any specific requirements?"
+        ])
+    elif any(word in q for word in ["employee", "staff", "worker"]):
+        base_followups.extend([
+            "Do you need information about employee procedures?",
+            "Would you like to know about training requirements?"
+        ])
+    elif any(word in q for word in ["time", "schedule", "hours"]):
+        base_followups.extend([
+            "Do you need information about scheduling procedures?",
+            "Would you like details about time-off policies?"
+        ])
+    else:
+        base_followups.extend([
+            "Do you want to know more details?",
+            "Would you like steps for a related task?",
+            "Need help finding a specific document?"
+        ])
+    
+    return base_followups[:3]  # Return top 3
 
 def is_vague(query): 
-    """Check if query needs clarification"""
-    return len(query.split()) < 3 or not query.strip().endswith("?")
+    """Enhanced vague query detection"""
+    if not query or len(query.strip()) < 3:
+        return True
+        
+    # Very short queries without context
+    if len(query.split()) < 2:
+        return True
+        
+    # Single word questions (except specific ones)
+    words = query.lower().split()
+    if len(words) == 1 and words[0] not in ['help', 'documents', 'procedures', 'policies']:
+        return True
+        
+    # Greetings without questions
+    greetings = ['hello', 'hi', 'hey', 'good morning', 'good afternoon']
+    if any(greeting in query.lower() for greeting in greetings) and '?' not in query:
+        return True
+        
+    return False
 
 # ---- Embedding Worker ----
 def embed_sop_worker(fpath, metadata=None):
@@ -158,7 +203,7 @@ def home():
     return jsonify({
         "status": "ok", 
         "message": "🚀 OpsVoice RAG API is live!",
-        "version": "1.0.0"
+        "version": "1.0.1"
     })
 
 @app.route("/healthz")
@@ -229,23 +274,14 @@ def upload_sop():
         "sop_file_url": f"{request.host_url.rstrip('/')}/static/sop-files/{safe_filename}"
     })
 
-# Rate limiting
-query_counts = {}
-RATE_LIMIT_MIN = 15
-
+# Rate limiting - simplified for MVP
 def check_rate_limit(tenant: str) -> bool:
-    """Check if tenant is within rate limits"""
-    return True  # Temporarily disable rate limiting
-
-# Company voice settings
-COMPANY_VOICES = {
-    "chelco-3153": "Chelco Assistant: Professional and helpful.",
-    "demo_company_123": "Demo Assistant: Here to help with your questions."
-}
+    """Simplified rate limiting for MVP"""
+    return True  # Disable rate limiting for now
 
 @app.route("/query", methods=["POST"])
 def query_sop():
-    """Query documents using RAG"""
+    """Enhanced query processing with better fallbacks"""
     global vectorstore
     if vectorstore is None: 
         load_vectorstore()
@@ -257,22 +293,50 @@ def query_sop():
     if not qtext or not tenant:
         return jsonify({"error": "Missing query or company_id_slug"}), 400
 
-    # Rate limiting
+    # Rate limiting (simplified)
     if not check_rate_limit(tenant):
         return jsonify({"error": "Too many requests, try again in a minute."}), 429
+
+    # Special handling for document listing queries
+    doc_keywords = ['what documents', 'what files', 'what sops', 'uploaded documents', 'what do you have', 'what can you help']
+    if any(keyword in qtext.lower() for keyword in doc_keywords):
+        try:
+            docs_response = requests.get(f"{request.host_url}company-docs/{tenant}")
+            if docs_response.status_code == 200:
+                docs = docs_response.json()
+                if docs:
+                    doc_titles = []
+                    for doc in docs:
+                        title = doc.get('title', doc.get('filename', 'Unknown Document'))
+                        if title.endswith('.docx') or title.endswith('.pdf'):
+                            title = title.rsplit('.', 1)[0]  # Remove extension
+                        doc_titles.append(title)
+                    
+                    return jsonify({
+                        "answer": f"I have access to {len(doc_titles)} documents: {', '.join(doc_titles)}. I can answer questions about any of these procedures and policies.",
+                        "source": "document_list",
+                        "followups": [
+                            "Would you like details about any specific procedure?",
+                            "Do you need help with a particular process?",
+                            "What specific information are you looking for?"
+                        ]
+                    })
+        except Exception as e:
+            print(f"[DOC_LIST] Error: {e}")
 
     # Check for vague queries
     if is_vague(qtext):
         return jsonify({
-            "answer": "Can you give me more detail—like the specific SOP or process you're referring to?",
-            "source": "clarify"
+            "answer": "Can you give me more detail—like the specific procedure or process you're referring to?",
+            "source": "clarify",
+            "followups": generate_followups(qtext)
         })
 
-    # Filter out off-topic queries
-    off_topic_keywords = ["gmail", "facebook", "amazon account", "weather", "news", "stock price"]
+    # Filter out completely off-topic queries
+    off_topic_keywords = ["weather", "news", "stock price", "sports", "celebrity", "movie"]
     if any(keyword in qtext.lower() for keyword in off_topic_keywords):
         return jsonify({
-            "answer": "That's outside your company SOPs—please use the official help portal or ask about your internal procedures.",
+            "answer": "I'm focused on helping with your business procedures and operations. Please ask about your company's SOPs, policies, or general business questions.",
             "source": "off_topic"
         })
 
@@ -280,7 +344,7 @@ def query_sop():
         # Set up retriever with company filtering
         retriever = vectorstore.as_retriever(
             search_kwargs={
-                "k": 5, 
+                "k": 7,  # More documents for better context
                 "filter": {"company_id_slug": tenant}
             }
         )
@@ -303,50 +367,55 @@ def query_sop():
         result = qa.invoke({"question": qtext})
         answer = clean_text(result.get("answer", ""))
 
-        # Security check
-        if contains_sensitive(answer):
-            return jsonify({
-                "answer": "Sorry, that information contains sensitive data—please contact your admin directly.",
-                "source": "sensitive"
-            })
+        # Skip sensitivity check for MVP
+        # if contains_sensitive(answer):
+        #     return jsonify({"answer": "Sorry, that information contains sensitive data—please contact your admin directly.", "source": "sensitive"})
 
         # Check if answer is helpful
         if is_unhelpful_answer(answer):
-            # Fallback to general business knowledge
+            # Enhanced fallback with business context
             try:
                 fallback_prompt = f"""
                 The user asked: "{qtext}"
                 
-                Their company SOPs don't cover this topic. Provide a helpful, professional business response 
-                that gives general best practices or guidance. Keep it concise and actionable.
+                This is a business assistant for a company. Their company SOPs don't cover this specific topic, 
+                but provide a helpful, professional business response with general best practices, industry standards, 
+                or actionable guidance. Keep it concise but valuable. Focus on:
+                - Industry best practices
+                - Professional recommendations  
+                - Actionable steps
+                - Business-focused advice
+                
+                If it's about procedures they don't have documented, suggest they create documentation for it.
                 """
                 
-                fallback = ChatOpenAI(temperature=0.3).invoke(fallback_prompt)
+                fallback = ChatOpenAI(temperature=0.3, model="gpt-4").invoke(fallback_prompt)
                 fallback_text = clean_text(getattr(fallback, "content", str(fallback)))
                 
-                company_voice = COMPANY_VOICES.get(tenant, "")
-                
                 return jsonify({
-                    "answer": f"{company_voice} {fallback_text}",
+                    "answer": fallback_text,
                     "fallback_used": True,
-                    "followups": generate_followups(qtext),
-                    "source": "fallback"
+                    "followups": [
+                        "Would you like me to help you create documentation for this?",
+                        "Do you want to know about related procedures?",
+                        "Need help with anything else?"
+                    ],
+                    "source": "business_fallback"
                 })
             except Exception as e:
                 print(f"[FALLBACK] Error: {e}")
                 return jsonify({
-                    "answer": "I don't have specific information about that in your SOPs. Could you try asking about a different topic or contact your admin?",
-                    "source": "no_info"
+                    "answer": "I don't have specific information about that in your SOPs, but I'd be happy to help if you can provide more context or ask about other procedures I have access to.",
+                    "source": "no_info",
+                    "followups": generate_followups(qtext)
                 })
 
-        # Truncate long answers for TTS
+        # Truncate long answers for voice
         if len(answer.split()) > 80:
-            answer = "Here's a summary: " + " ".join(answer.split()[:70]) + "... For complete details, check your SOPs."
+            answer = "Here's a summary: " + " ".join(answer.split()[:70]) + "... For complete details, you can ask for more specifics."
 
-        company_voice = COMPANY_VOICES.get(tenant, "")
-        
         return jsonify({
-            "answer": f"{company_voice} {answer}",
+            "answer": answer,
             "fallback_used": False,
             "followups": generate_followups(qtext),
             "source": "sop",
@@ -355,7 +424,13 @@ def query_sop():
 
     except Exception as e:
         print(f"[QUERY] Error: {e}")
-        return jsonify({"error": "Query failed", "details": str(e)}), 500
+        # Better error handling
+        return jsonify({
+            "answer": "I'm having trouble accessing the information right now. Please try rephrasing your question or ask about a different topic.",
+            "error": "Query processing failed", 
+            "source": "error",
+            "followups": ["Try asking about a specific procedure", "Rephrase your question", "Ask about available documents"]
+        })
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
 def voice_reply():
