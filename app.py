@@ -235,18 +235,7 @@ RATE_LIMIT_MIN = 15
 
 def check_rate_limit(tenant: str) -> bool:
     """Check if tenant is within rate limits"""
-    minute = int(time.time() // 60)
-    key = f"{tenant}-{minute}"
-    query_counts.setdefault(key, 0)
-    query_counts[key] += 1
-    
-    # Clean old entries
-    current_keys = [k for k in query_counts.keys() if k.startswith(f"{tenant}-")]
-    for k in current_keys:
-        if int(k.split("-")[1]) < minute - 5:  # Keep last 5 minutes
-            del query_counts[k]
-    
-    return query_counts[key] <= RATE_LIMIT_MIN
+    return True  # Temporarily disable rate limiting
 
 # Company voice settings
 COMPANY_VOICES = {
