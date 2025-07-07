@@ -269,6 +269,36 @@ def ensure_vectorstore():
     try:
         if not vectorstore:
             load_vectorstore()
+
+def get_company_documents_internal(company_id_slug):
+    """Internal function to get company documents without HTTP request"""
+    if not os.path.exists(STATUS_FILE): 
+        return []
+    
+    try:
+        data = json.load(open(STATUS_FILE))
+        company_docs = []
+        
+        for filename, metadata in data.items():
+            if metadata.get("company_id_slug") == company_id_slug:
+                doc_info = {
+                    "filename": filename,
+                    "title": metadata.get("title", filename),
+                    "status": metadata.get("status", "unknown"),
+                    "company_id_slug": company_id_slug,
+                    "uploaded_at": metadata.get("uploaded_at")
+                }
+                company_docs.append(doc_info)
+        
+        return company_docs
+        
+    except Exception as e:
+        print(f"[DOCS_INTERNAL] Error: {e}")
+        return []
+
+# ---- Embedding Worker ----
+def embed_sop_worker(fpath, metadata=None):
+    # ... existing function ...
         
         # Test vectorstore health
         if vectorstore and hasattr(vectorstore, '_collection'):
@@ -465,9 +495,8 @@ def query_sop():
     doc_keywords = ['what documents', 'what files', 'what sops', 'uploaded documents', 'what do you have', 'what can you help']
     if any(keyword in qtext.lower() for keyword in doc_keywords):
         try:
-            docs_response = requests.get(f"{request.host_url}company-docs/{tenant}")
-            if docs_response.status_code == 200:
-                docs = docs_response.json()
+            # ADD THIS:
+            docs = get_company_documents_internal(tenant)           
                 if docs:
                     doc_titles = []
                     for doc in docs:
