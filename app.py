@@ -269,7 +269,19 @@ def ensure_vectorstore():
     try:
         if not vectorstore:
             load_vectorstore()
+        
+        # Test vectorstore health
+        if vectorstore and hasattr(vectorstore, '_collection'):
+            test_results = vectorstore.similarity_search("test", k=1)
+            print(f"[DB] Vectorstore healthy, {len(test_results)} test results")
+        
+        return vectorstore is not None
+    except Exception as e:
+        print(f"[DB] Vectorstore health check failed: {e}")
+        load_vectorstore()
+        return vectorstore is not None
 
+# ADD THE NEW FUNCTION HERE - AFTER the complete ensure_vectorstore function
 def get_company_documents_internal(company_id_slug):
     """Internal function to get company documents without HTTP request"""
     if not os.path.exists(STATUS_FILE): 
@@ -295,21 +307,6 @@ def get_company_documents_internal(company_id_slug):
     except Exception as e:
         print(f"[DOCS_INTERNAL] Error: {e}")
         return []
-
-# ---- Embedding Worker ----
-def embed_sop_worker(fpath, metadata=None):
-    # ... existing function ...
-        
-        # Test vectorstore health
-        if vectorstore and hasattr(vectorstore, '_collection'):
-            test_results = vectorstore.similarity_search("test", k=1)
-            print(f"[DB] Vectorstore healthy, {len(test_results)} test results")
-        
-        return vectorstore is not None
-    except Exception as e:
-        print(f"[DB] Vectorstore health check failed: {e}")
-        load_vectorstore()
-        return vectorstore is not None
 
 # ---- Embedding Worker ----
 def embed_sop_worker(fpath, metadata=None):
@@ -497,7 +494,7 @@ def query_sop():
         try:
             # ADD THIS:
             docs = get_company_documents_internal(tenant)           
-                if docs:
+            if docs:
                     doc_titles = []
                     for doc in docs:
                         title = doc.get('title', doc.get('filename', 'Unknown Document'))
