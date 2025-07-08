@@ -14,7 +14,7 @@ from flask_cors import CORS
 load_dotenv()
 
 # ---- Paths & Setup ----
-DATA_PATH = "/opt/render/project/src/data"  # ← Your project directory (always writable)
+DATA_PATH = "/opt/render/project/src/data"
 SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
 CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
 AUDIO_CACHE_DIR = os.path.join(DATA_PATH, "audio_cache")
@@ -32,7 +32,8 @@ performance_metrics = {
     "total_queries": 0,
     "cache_hits": 0,
     "avg_response_time": 0,
-    "model_usage": {"gpt-3.5-turbo": 0, "gpt-4": 0}
+    "model_usage": {"gpt-3.5-turbo": 0, "gpt-4": 0},
+    "response_sources": {"sop": 0, "fallback": 0, "cache": 0}
 }
 
 # Clean Chroma on startup
@@ -74,15 +75,60 @@ def clean_text(txt: str) -> str:
     txt = txt.strip()
     return txt
 
+def smart_truncate(text, max_words=150):
+    """Smart truncation that preserves complete sentences and adds continuation prompts"""
+    if not text:
+        return text
+    
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    
+    # Find the last complete sentence within limit
+    truncated = " ".join(words[:max_words])
+    
+    # Find last sentence ending
+    sentence_endings = ['.', '!', '?', ':']
+    last_ending = -1
+    
+    for ending in sentence_endings:
+        pos = truncated.rfind(ending)
+        if pos > last_ending:
+            last_ending = pos
+    
+    # If we found a good sentence break (and it's not too short)
+    if last_ending > len(truncated) * 0.6:
+        return truncated[:last_ending + 1] + " Would you like me to continue with more details?"
+    else:
+        # Fallback: find last complete phrase
+        last_comma = truncated.rfind(',')
+        if last_comma > len(truncated) * 0.7:
+            return truncated[:last_comma] + ". For the complete procedure, please ask me to continue."
+        else:
+            # Final fallback
+            return " ".join(words[:130]) + "... Should I continue with the rest of the details?"
+
+def get_session_memory(session_id):
+    """Get or create conversation memory for session"""
+    global conversation_sessions
+    
+    if session_id not in conversation_sessions:
+        conversation_sessions[session_id] = ConversationBufferMemory(
+            memory_key="chat_history", 
+            return_messages=True,
+            output_key="answer"
+        )
+    return conversation_sessions[session_id]
+
 def get_query_complexity(query: str) -> str:
     """Determine if query is simple or complex for model selection"""
     words = query.lower().split()
     
     # Simple query indicators
     simple_indicators = [
-        len(words) <= 10,  # Short queries
+        len(words) <= 8,  # Short queries
         any(word in query.lower() for word in ['what', 'when', 'where', 'who', 'how many']),
-        query.endswith('?') and len(words) <= 8
+        query.endswith('?') and len(words) <= 6
     ]
     
     # Complex query indicators  
@@ -101,28 +147,29 @@ def get_query_complexity(query: str) -> str:
         return "medium"
 
 def get_optimal_llm(complexity: str) -> ChatOpenAI:
-    """Select optimal LLM based on query complexity"""
+    """Select optimal LLM based on query complexity - PERFORMANCE OPTIMIZATION"""
     global performance_metrics
     
     if complexity == "simple":
         performance_metrics["model_usage"]["gpt-3.5-turbo"] += 1
-        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo")  # 2x faster
     else:  # medium or complex
         performance_metrics["model_usage"]["gpt-4"] += 1
         return ChatOpenAI(temperature=0, model="gpt-4")
 
 def get_cache_key(query: str, company_id: str) -> str:
     """Generate cache key for query"""
-    combined = f"{company_id}:{query.lower()}"
+    combined = f"{company_id}:{query.lower().strip()}"
     return hashlib.md5(combined.encode()).hexdigest()
 
 def get_cached_response(query: str, company_id: str) -> dict:
-    """Get cached response if available"""
+    """Get cached response if available - PERFORMANCE OPTIMIZATION"""
     cache_key = get_cache_key(query, company_id)
     cached = query_cache.get(cache_key)
     
     if cached and time.time() - cached['timestamp'] < 3600:  # 1 hour cache
         performance_metrics["cache_hits"] += 1
+        performance_metrics["response_sources"]["cache"] += 1
         print(f"[CACHE] Cache hit for query: {query[:50]}...")
         return cached['response']
     
@@ -143,21 +190,12 @@ def cache_response(query: str, company_id: str, response: dict):
         for key in oldest_keys:
             del query_cache[key]
 
-def get_conversation_memory(session_id: str) -> ConversationBufferMemory:
-    """Get or create conversation memory for session"""
-    if session_id not in conversation_sessions:
-        conversation_sessions[session_id] = ConversationBufferMemory(
-            memory_key="chat_history", 
-            return_messages=True,
-            output_key="answer"
-        )
-    return conversation_sessions[session_id]
-
 def update_metrics(response_time: float, source: str):
     """Update performance metrics"""
     global performance_metrics
     
     performance_metrics["total_queries"] += 1
+    performance_metrics["response_sources"][source] = performance_metrics["response_sources"].get(source, 0) + 1
     
     # Update average response time
     current_avg = performance_metrics["avg_response_time"]
@@ -281,7 +319,6 @@ def ensure_vectorstore():
         load_vectorstore()
         return vectorstore is not None
 
-# ADD THE NEW FUNCTION HERE - AFTER the complete ensure_vectorstore function
 def get_company_documents_internal(company_id_slug):
     """Internal function to get company documents without HTTP request"""
     if not os.path.exists(STATUS_FILE): 
@@ -348,10 +385,10 @@ def embed_sop_worker(fpath, metadata=None):
             keywords_string = " ".join(keywords)  # Convert to string
 
             chunk.metadata.update({
-            **(metadata or {}),
-            "chunk_id": f"{fname}_{i}",
-            "chunk_type": chunk_type,
-            "keywords": keywords_string  # ← NOW IT'S A STRING
+                **(metadata or {}),
+                "chunk_id": f"{fname}_{i}",
+                "chunk_type": chunk_type,
+                "keywords": keywords_string  # ← NOW IT'S A STRING
             })
        
         db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
@@ -412,8 +449,8 @@ def home():
     return jsonify({
         "status": "ok", 
         "message": "🚀 OpsVoice RAG API is live!",
-        "version": "1.1.0",
-        "features": ["smart_caching", "model_optimization", "context_tracking"]
+        "version": "1.2.0",
+        "features": ["smart_caching", "model_optimization", "session_memory", "smart_truncation"]
     })
 
 @app.route("/healthz")
@@ -423,7 +460,8 @@ def healthz():
         "timestamp": time.time(),
         "vectorstore": "loaded" if vectorstore else "not_loaded",
         "cache_size": len(query_cache),
-        "active_sessions": len(conversation_sessions)
+        "active_sessions": len(conversation_sessions),
+        "avg_response_time": performance_metrics["avg_response_time"]
     })
 
 @app.route("/metrics")
@@ -498,17 +536,26 @@ def check_rate_limit(tenant: str) -> bool:
 
 @app.route("/query", methods=["POST"])
 def query_sop():
-    """Enhanced query processing with better retrieval"""
+    """ENHANCED query processing with session memory, smart truncation, and performance optimization"""
+    start_time = time.time()
     global vectorstore
+    
     if vectorstore is None: 
         load_vectorstore()
 
     payload = request.get_json() or {}
     qtext = clean_text(payload.get("query", ""))
     tenant = re.sub(r"[^\w\-]", "", payload.get("company_id_slug", ""))
+    session_id = payload.get("session_id", f"{tenant}_{int(time.time())}")  # SESSION SUPPORT
 
     if not qtext or not tenant:
         return jsonify({"error": "Missing query or company_id_slug"}), 400
+
+    # Check cache first - PERFORMANCE OPTIMIZATION
+    cached_response = get_cached_response(qtext, tenant)
+    if cached_response:
+        update_metrics(time.time() - start_time, "cache")
+        return jsonify(cached_response)
 
     # Rate limiting
     if not check_rate_limit(tenant):
@@ -516,34 +563,41 @@ def query_sop():
 
     # Check for vague queries
     if is_vague(qtext):
-        return jsonify({
+        response = {
             "answer": "Can you give me more detail—like the specific SOP or process you're referring to?",
             "source": "clarify"
-        })
+        }
+        update_metrics(time.time() - start_time, "clarify")
+        return jsonify(response)
 
     # Filter out off-topic queries
     off_topic_keywords = ["gmail", "facebook", "amazon account", "weather", "news", "stock price"]
     if any(keyword in qtext.lower() for keyword in off_topic_keywords):
-        return jsonify({
+        response = {
             "answer": "That's outside your company SOPs—please use the official help portal or ask about your internal procedures.",
             "source": "off_topic"
-        })
+        }
+        update_metrics(time.time() - start_time, "off_topic")
+        return jsonify(response)
 
     try:
-        # ENHANCED MULTI-STAGE RETRIEVAL
-        print(f"[QUERY] Processing: {qtext} for company: {tenant}")
+        # PERFORMANCE OPTIMIZATION - Select optimal model
+        complexity = get_query_complexity(qtext)
+        optimal_llm = get_optimal_llm(complexity)
         
-        # Stage 1: Direct search with company filter
-        retriever = vectorstore.as_retriever(
-            search_kwargs={
-                "k": 8,  # INCREASED from 5
-                "filter": {"company_id_slug": tenant}
-            }
-        )
+        print(f"[QUERY] Using {optimal_llm.model_name} for {complexity} query: {qtext[:50]}...")
         
         # Expand query with synonyms for better matching
         expanded_query = expand_query_with_synonyms(qtext)
         print(f"[QUERY] Expanded query: {expanded_query}")
+        
+        # PERFORMANCE OPTIMIZATION - Reduced retrieval for faster processing
+        retriever = vectorstore.as_retriever(
+            search_kwargs={
+                "k": 5,  # REDUCED from 8 for faster processing
+                "filter": {"company_id_slug": tenant}
+            }
+        )
         
         # Try to get documents
         relevant_docs = retriever.get_relevant_documents(expanded_query)
@@ -551,23 +605,19 @@ def query_sop():
         if not relevant_docs:
             print(f"[QUERY] No docs with company filter, trying without filter")
             # Try without company filter
-            general_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+            general_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})  # Reduced for speed
             relevant_docs = general_retriever.get_relevant_documents(expanded_query)
         
         print(f"[QUERY] Found {len(relevant_docs)} relevant documents")
         
         if relevant_docs:
-            # Create conversational chain
-            memory = ConversationBufferMemory(
-                memory_key="chat_history", 
-                return_messages=True,
-                output_key="answer"
-            )
+            # SESSION MEMORY - Get persistent memory for this session
+            memory = get_session_memory(session_id)
             
             qa = ConversationalRetrievalChain.from_llm(
-                ChatOpenAI(temperature=0, model="gpt-4"),
+                optimal_llm,  # Use optimal model based on complexity
                 retriever=vectorstore.as_retriever(search_kwargs={"k": len(relevant_docs)}),
-                memory=memory,
+                memory=memory,  # SESSION MEMORY
                 return_source_documents=True
             )
             
@@ -582,26 +632,25 @@ def query_sop():
             if answer and len(answer.split()) > 10 and not is_generic:
                 print(f"[QUERY] Success - found relevant answer")
                 
-                # Truncate long answers for TTS
-                if len(answer.split()) > 80:
-                    answer = "Here's a summary: " + " ".join(answer.split()[:70]) + "... For complete details, check your SOPs."
+                # SMART TRUNCATION - Preserves complete sentences
+                if len(answer.split()) > 150:
+                    answer = smart_truncate(answer, 150)
                
-                # Get company voice (inline instead of COMPANY_VOICES)
-                company_voices = {
-                "chelco-3153": "Chelco Assistant: Professional and helpful.",
-                "demo_company_123": "Demo Assistant: Here to help with your questions.",
-                "demo-business-123": "Demo Business Assistant: Here to help with your questions."
-                }
-                company_voice = company_voices.get(tenant, "")
-                
-                
-                return jsonify({
-                    "answer": f"{company_voice} {answer}",
+                # CLEAN RESPONSES - No company prefix
+                response = {
+                    "answer": answer,  # NO MORE COMPANY PREFIX
                     "fallback_used": False,
                     "followups": generate_contextual_followups(qtext, answer),
                     "source": "sop",
-                    "source_documents": len(relevant_docs)
-                })
+                    "source_documents": len(relevant_docs),
+                    "session_id": session_id,  # SESSION SUPPORT
+                    "model_used": optimal_llm.model_name  # DEBUG INFO
+                }
+                
+                # Cache successful responses
+                cache_response(qtext, tenant, response)
+                update_metrics(time.time() - start_time, "sop")
+                return jsonify(response)
 
         # Enhanced fallback
         print(f"[QUERY] Using enhanced fallback")
@@ -639,15 +688,20 @@ This might be because:
 
 Try asking about procedures, policies, or customer service topics that might be in your uploaded documents."""
         
-        return jsonify({
+        response = {
             "answer": fallback_answer,
             "fallback_used": True,
             "followups": ["Can you be more specific?", "What department handles this?", "Try asking about a specific procedure"],
-            "source": "fallback"
-        })
+            "source": "fallback",
+            "session_id": session_id
+        }
+        
+        update_metrics(time.time() - start_time, "fallback")
+        return jsonify(response)
 
     except Exception as e:
         print(f"[QUERY] Error: {e}")
+        update_metrics(time.time() - start_time, "error")
         return jsonify({"error": "Query failed", "details": str(e)}), 500
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
@@ -817,6 +871,67 @@ def clear_sessions():
         "message": f"Cleared {session_count} conversation sessions"
     })
 
+# NEW ENDPOINT: Get session info for debugging
+@app.route("/session-info/<session_id>")
+def get_session_info(session_id):
+    """Get information about a conversation session"""
+    if session_id in conversation_sessions:
+        memory = conversation_sessions[session_id]
+        messages = []
+        if hasattr(memory, 'chat_memory') and hasattr(memory.chat_memory, 'messages'):
+            messages = [{"type": type(msg).__name__, "content": msg.content[:100]} for msg in memory.chat_memory.messages]
+        
+        return jsonify({
+            "session_id": session_id,
+            "message_count": len(messages),
+            "messages": messages
+        })
+    else:
+        return jsonify({"error": "Session not found"}), 404
+
+# NEW ENDPOINT: Continue conversation explicitly
+@app.route("/continue", methods=["POST"])
+def continue_conversation():
+    """Explicitly continue from where we left off"""
+    payload = request.get_json() or {}
+    session_id = payload.get("session_id")
+    tenant = payload.get("company_id_slug", "")
+    
+    if not session_id or session_id not in conversation_sessions:
+        return jsonify({"error": "No conversation session found"}), 400
+    
+    memory = conversation_sessions[session_id]
+    
+    # Get last AI response from memory
+    last_response = ""
+    if hasattr(memory, 'chat_memory') and hasattr(memory.chat_memory, 'messages'):
+        for msg in reversed(memory.chat_memory.messages):
+            if hasattr(msg, 'content') and len(msg.content) > 50:
+                last_response = msg.content
+                break
+    
+    if last_response:
+        # Check if it was truncated
+        if "Would you like me to continue" in last_response or "Should I continue" in last_response:
+            # Generate continuation
+            continue_prompt = "Please continue from where you left off with the rest of the details."
+            
+            # Use the same query processing but with continuation context
+            payload["query"] = continue_prompt
+            return query_sop()
+        else:
+            return jsonify({
+                "answer": "I don't see that the previous response was truncated. What specific aspect would you like me to elaborate on?",
+                "source": "clarification",
+                "session_id": session_id
+            })
+    else:
+        return jsonify({
+            "answer": "I don't have a previous response to continue from. What would you like to know?",
+            "source": "clarification",
+            "session_id": session_id
+        })
+
 # Error handlers
 @app.errorhandler(404)
 def not_found(error):
@@ -843,6 +958,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[STARTUP] Could not load metrics: {e}")
     
-    print(f"[STARTUP] Starting Optimized OpsVoice API v1.1.0 on port {port}")
-    print(f"[STARTUP] Features: Smart Caching, Model Optimization, Context Tracking")
+    print(f"[STARTUP] Starting Optimized OpsVoice API v1.2.0 on port {port}")
+    print(f"[STARTUP] Features: Smart Caching, Session Memory, Smart Truncation, Model Optimization")
+    print(f"[STARTUP] Performance: Target 3-5s response time (down from 12s)")
     app.run(host="0.0.0.0", port=port, debug=False)
