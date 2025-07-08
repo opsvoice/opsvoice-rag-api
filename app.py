@@ -101,6 +101,8 @@ def validate_file_upload(file):
 
 def check_rate_limit_mvp(tenant: str) -> bool:
     """Simple rate limiting for MVP"""
+    global rate_limits  # ADD THIS LINE
+    
     current_minute = int(time.time() // 60)
     key = f"{tenant}:{current_minute}"
     
