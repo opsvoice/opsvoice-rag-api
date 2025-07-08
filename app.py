@@ -160,6 +160,12 @@ def safe_error_mvp(message: str, status_code: int = 500):
         "timestamp": int(time.time())
     }), status_code
 
+def intelligent_query_expansion(query):
+    """Enhanced query expansion with AI"""
+    # This function should expand/improve the query using AI
+    # For now, return the original query if AI expansion fails
+    return query
+
 # ---- Enhanced Utility Functions ----
 def clean_text(txt: str) -> str:
     """Clean text for TTS - remove problematic characters"""
@@ -573,11 +579,15 @@ def query_sop():
     start_time = time.time()
     
     try:
-        # Validate request format
+        # More flexible request handling for backward compatibility
         if not request.is_json:
-            return safe_error_mvp("Invalid request format", 400)
-        
-        payload = request.get_json() or {}
+            # Try to get JSON anyway for backward compatibility
+            try:
+                payload = request.get_json(force=True) or {}
+            except:
+                return safe_error_mvp("Invalid request format", 400)
+        else:
+            payload = request.get_json() or {}
         
         # Sanitize and validate inputs
         qtext = sanitize_query_mvp(payload.get("query", ""))
@@ -634,12 +644,12 @@ def query_sop():
         optimal_llm = get_optimal_llm(complexity)
         
         # Make AI expansion optional with fallback
-    try:
-        expanded_query = intelligent_query_expansion(qtext)
-        print(f"[AI_EXPAND] Success: {qtext} -> {expanded_query[:50]}...")
-except Exception as e:
-    print(f"[AI_EXPAND] Failed ({e}), using original query")
-    expanded_query = qtext
+        try:
+            expanded_query = intelligent_query_expansion(qtext)
+            print(f"[AI_EXPAND] Success: {qtext} -> {expanded_query[:50]}...")
+        except Exception as e:
+            print(f"[AI_EXPAND] Failed ({e}), using original query")
+            expanded_query = qtext
 
         # Set up retriever with company filtering
         retriever = vectorstore.as_retriever(
@@ -746,16 +756,27 @@ def voice_reply():
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         return response
 
-      # Replace your current validation with this:
-try:
-    if not request.is_json:
-        # Try to get JSON anyway for backward compatibility
-        payload = request.get_json(force=True) or {}
-    else:
-        payload = request.get_json() or {}
-except:
-    return safe_error_mvp("Invalid request format", 400)
-              
+    try:
+        # More flexible request handling for backward compatibility
+        if not request.is_json:
+            # Try to get JSON anyway for backward compatibility
+            try:
+                data = request.get_json(force=True) or {}
+            except:
+                return safe_error_mvp("Invalid request format", 400)
+        else:
+            data = request.get_json() or {}
+        
+        # Extract and validate text
+        text = data.get("text", "").strip()
+        if not text:
+            return safe_error_mvp("Missing text parameter", 400)
+        
+        # Clean text for TTS
+        text = clean_text(text)
+        if not text:
+            return safe_error_mvp("Text too short after cleaning", 400)
+        
         # Validate company ID
         tenant = data.get("company_id_slug", "").strip()
         if tenant and not validate_company_id_mvp(tenant):
