@@ -10,7 +10,6 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from flask_cors import CORS
-from enhanced_functions import enhanced_embed_sop_worker, enhanced_query_processing
 
 load_dotenv()
 
@@ -311,8 +310,7 @@ def get_company_documents_internal(company_id_slug):
 
 # ---- Embedding Worker ----
 def embed_sop_worker(fpath, metadata=None):
-    """Background worker to embed documents - now using enhanced version"""
-    enhanced_embed_sop_worker(fpath, metadata, CHROMA_DIR, embedding, update_status)
+    """Background worker to embed documents"""
     fname = os.path.basename(fpath)
     try:
         ext = fname.rsplit(".", 1)[-1].lower()
@@ -455,20 +453,17 @@ def check_rate_limit(tenant: str) -> bool:
 
 @app.route("/query", methods=["POST"])
 def query_sop():
-    """Query documents using enhanced RAG"""
-    global vectorstore
-    if vectorstore is None: 
-        load_vectorstore()
+    """Enhanced query processing with caching and smart model selection"""
+    start_time = time.time()
+    
+    # Ensure vectorstore is healthy
+    if not ensure_vectorstore():
+        return jsonify({
+            "error": "Database temporarily unavailable", 
+            "answer": "I'm having trouble accessing the document database. Please try again in a moment.",
+            "source": "db_error"
+        }), 503
 
-    payload = request.get_json() or {}
-    qtext = clean_text(payload.get("query", ""))
-    tenant = re.sub(r"[^\w\-]", "", payload.get("company_id_slug", ""))
-
-    if not qtext or not tenant:
-        return jsonify({"error": "Missing query or company_id_slug"}), 400
-
-    # Use enhanced query processing
-    return enhanced_query_processing(qtext, tenant, vectorstore, clean_text, check_rate_limit, is_vague, COMPANY_VOICES, generate_followups)
     payload = request.get_json() or {}
     qtext = clean_text(payload.get("query", ""))
     tenant = re.sub(r"[^\w\-]", "", payload.get("company_id_slug", ""))
