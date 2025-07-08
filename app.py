@@ -593,7 +593,8 @@ def query_sop():
             return safe_error_mvp("Too many requests - please wait a moment", 429)
         
         # Session management
-        session_id = payload.get("session_id", f"{tenant}_{secrets.token_hex(8)}")
+        # Make session_id optional for backward compatibility
+        session_id = payload.get("session_id") or f"{tenant}_{int(time.time())}"
         session_id = re.sub(r'[^a-zA-Z0-9_\-]', '', session_id)[:64]  # Sanitize session ID
         
         # Check cache first for performance
@@ -632,9 +633,14 @@ def query_sop():
         complexity = get_query_complexity(qtext)
         optimal_llm = get_optimal_llm(complexity)
         
-        # Expand query with synonyms for better matching
-        expanded_query = expand_query_with_synonyms(qtext)
-        
+        # Make AI expansion optional with fallback
+    try:
+        expanded_query = intelligent_query_expansion(qtext)
+        print(f"[AI_EXPAND] Success: {qtext} -> {expanded_query[:50]}...")
+except Exception as e:
+    print(f"[AI_EXPAND] Failed ({e}), using original query")
+    expanded_query = qtext
+
         # Set up retriever with company filtering
         retriever = vectorstore.as_retriever(
             search_kwargs={
@@ -740,16 +746,16 @@ def voice_reply():
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         return response
 
-    try:
-        if not request.is_json:
-            return safe_error_mvp("Invalid request format", 400)
-        
-        data = request.get_json() or {}
-        text = clean_text(data.get("query", ""))
-        
-        if not text or len(text.strip()) < 1:
-            return safe_error_mvp("Empty text", 400)
-        
+      # Replace your current validation with this:
+try:
+    if not request.is_json:
+        # Try to get JSON anyway for backward compatibility
+        payload = request.get_json(force=True) or {}
+    else:
+        payload = request.get_json() or {}
+except:
+    return safe_error_mvp("Invalid request format", 400)
+              
         # Validate company ID
         tenant = data.get("company_id_slug", "").strip()
         if tenant and not validate_company_id_mvp(tenant):
