@@ -341,18 +341,19 @@ def embed_sop_worker(fpath, metadata=None):
             else:
                 chunk_type = "general"
             
-            # Extract simple keywords
+            # Extract simple keywords as a string (not list)
             words = re.findall(r'\b[a-zA-Z]{4,}\b', chunk.page_content.lower())
             stopwords = {'that', 'this', 'with', 'they', 'have', 'will', 'from', 'been', 'were'}
             keywords = [word for word in set(words) if word not in stopwords][:5]
-            
+            keywords_string = " ".join(keywords)  # Convert to string
+
             chunk.metadata.update({
-                **(metadata or {}),
-                "chunk_id": f"{fname}_{i}",
-                "chunk_type": chunk_type,
-                "keywords": keywords
+            **(metadata or {}),
+            "chunk_id": f"{fname}_{i}",
+            "chunk_type": chunk_type,
+            "keywords": keywords_string  # ← NOW IT'S A STRING
             })
-        
+       
         db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
         db.add_documents(chunks)
         db.persist()
