@@ -10,7 +10,6 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from flask_cors import CORS
-from enhanced_functions import enhanced_embed_sop_worker, enhanced_query_processing
 
 load_dotenv()
 
@@ -311,36 +310,79 @@ def get_company_documents_internal(company_id_slug):
 
 # ---- Embedding Worker ----
 def embed_sop_worker(fpath, metadata=None):
-    """Background worker to embed documents - now using enhanced version"""
-    enhanced_embed_sop_worker(fpath, metadata, CHROMA_DIR, embedding, update_status)
+    """Enhanced embedding worker with better chunking for policies"""
     fname = os.path.basename(fpath)
     try:
-        ext = fname.rsplit(".", 1)[-1].lower()
+        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
         if ext == "docx":
             docs = UnstructuredWordDocumentLoader(fpath).load()
         elif ext == "pdf":
             docs = PyPDFLoader(fpath).load()
         else:
             raise ValueError(f"Unsupported file type: {ext}")
-            
+        
+        # ENHANCED CHUNKING - This is the key fix
         chunks = RecursiveCharacterTextSplitter(
-            chunk_size=500, 
-            chunk_overlap=100,
-            separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=1000,  # INCREASED from 500
+            chunk_overlap=200,  # INCREASED from 100
+            separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
         ).split_documents(docs)
         
-        # Add metadata to all chunks
-        for c in chunks: 
-            c.metadata.update(metadata or {})
+        # Add enhanced metadata for better search
+        for i, chunk in enumerate(chunks):
+            # Detect content type
+            content_lower = chunk.page_content.lower()
+            if any(word in content_lower for word in ["angry", "upset", "difficult", "complaint"]):
+                chunk_type = "customer_service"
+            elif any(word in content_lower for word in ["cash", "money", "payment", "refund"]):
+                chunk_type = "financial"
+            elif any(word in content_lower for word in ["first day", "onboard", "training"]):
+                chunk_type = "onboarding"
+            else:
+                chunk_type = "general"
             
+            # Extract simple keywords
+            words = re.findall(r'\b[a-zA-Z]{4,}\b', chunk.page_content.lower())
+            stopwords = {'that', 'this', 'with', 'they', 'have', 'will', 'from', 'been', 'were'}
+            keywords = [word for word in set(words) if word not in stopwords][:5]
+            
+            chunk.metadata.update({
+                **(metadata or {}),
+                "chunk_id": f"{fname}_{i}",
+                "chunk_type": chunk_type,
+                "keywords": keywords
+            })
+        
         db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
         db.add_documents(chunks)
         db.persist()
-        print(f"[EMBED] Successfully embedded {fname}")
-        update_status(fname, {"status": "embedded", **(metadata or {})})
+        
+        print(f"[EMBED] Successfully embedded {len(chunks)} chunks from {fname}")
+        update_status(fname, {"status": "embedded", "chunk_count": len(chunks), **(metadata or {})})
+        
     except Exception as e:
         print(f"[EMBED] Error with {fname}: {e}")
         update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
+
+def expand_query_with_synonyms(query):
+    """Expand query with common synonyms for better matching"""
+    synonyms = {
+        "angry": "angry upset difficult frustrated mad",
+        "customer": "customer client guest patron",
+        "handle": "handle deal manage respond",
+        "procedure": "procedure process protocol steps",
+        "policy": "policy rule guideline standard",
+        "refund": "refund return money back exchange",
+        "cash": "cash money payment transaction",
+        "first day": "first day onboarding orientation training new employee"
+    }
+    
+    expanded = query
+    for word, expansion in synonyms.items():
+        if word in query.lower():
+            expanded += f" {expansion}"
+    
+    return expanded
 
 def update_status(filename, status):
     """Update document processing status"""
@@ -455,7 +497,7 @@ def check_rate_limit(tenant: str) -> bool:
 
 @app.route("/query", methods=["POST"])
 def query_sop():
-    """Query documents using enhanced RAG"""
+    """Enhanced query processing with better retrieval"""
     global vectorstore
     if vectorstore is None: 
         load_vectorstore()
@@ -467,187 +509,145 @@ def query_sop():
     if not qtext or not tenant:
         return jsonify({"error": "Missing query or company_id_slug"}), 400
 
-    # Use enhanced query processing
-    return enhanced_query_processing(qtext, tenant, vectorstore, clean_text, check_rate_limit, is_vague, COMPANY_VOICES, generate_followups)
-    payload = request.get_json() or {}
-    qtext = clean_text(payload.get("query", ""))
-    tenant = re.sub(r"[^\w\-]", "", payload.get("company_id_slug", ""))
-    session_id = payload.get("session_id", f"{tenant}_{int(time.time())}")
-
-    if not qtext or not tenant:
-        return jsonify({"error": "Missing query or company_id_slug"}), 400
-
-    # Check cache first
-    cached_response = get_cached_response(qtext, tenant)
-    if cached_response:
-        update_metrics(time.time() - start_time, "cache")
-        return jsonify(cached_response)
-
-    # Rate limiting (simplified)
+    # Rate limiting
     if not check_rate_limit(tenant):
         return jsonify({"error": "Too many requests, try again in a minute."}), 429
 
-    # Get conversation memory for context
-    memory = get_conversation_memory(session_id)
-    previous_queries = []
-    if hasattr(memory, 'chat_memory') and hasattr(memory.chat_memory, 'messages'):
-        previous_queries = [msg.content for msg in memory.chat_memory.messages if hasattr(msg, 'content')]
-
-    # Special handling for document listing queries
-    doc_keywords = ['what documents', 'what files', 'what sops', 'uploaded documents', 'what do you have', 'what can you help']
-    if any(keyword in qtext.lower() for keyword in doc_keywords):
-        try:
-            # ADD THIS:
-            docs = get_company_documents_internal(tenant)           
-            if docs:
-                    doc_titles = []
-                    for doc in docs:
-                        title = doc.get('title', doc.get('filename', 'Unknown Document'))
-                        if title.endswith('.docx') or title.endswith('.pdf'):
-                            title = title.rsplit('.', 1)[0]  # Remove extension
-                        doc_titles.append(title)
-                    
-                    response = {
-                        "answer": f"I have access to {len(doc_titles)} documents: {', '.join(doc_titles)}. I can answer questions about any of these procedures and policies.",
-                        "source": "document_list",
-                        "followups": [
-                            "Would you like details about any specific procedure?",
-                            "Do you need help with a particular process?",
-                            "What specific information are you looking for?"
-                        ]
-                    }
-                    
-                    cache_response(qtext, tenant, response)
-                    update_metrics(time.time() - start_time, "document_list")
-                    return jsonify(response)
-        except Exception as e:
-            print(f"[DOC_LIST] Error: {e}")
-
     # Check for vague queries
     if is_vague(qtext):
-        response = {
-            "answer": "Can you give me more detail—like the specific procedure or process you're referring to?",
-            "source": "clarify",
-            "followups": generate_contextual_followups(qtext, "", previous_queries)
-        }
-        update_metrics(time.time() - start_time, "clarify")
-        return jsonify(response)
+        return jsonify({
+            "answer": "Can you give me more detail—like the specific SOP or process you're referring to?",
+            "source": "clarify"
+        })
 
-    # Filter out completely off-topic queries
-    off_topic_keywords = ["weather", "news", "stock price", "sports", "celebrity", "movie"]
+    # Filter out off-topic queries
+    off_topic_keywords = ["gmail", "facebook", "amazon account", "weather", "news", "stock price"]
     if any(keyword in qtext.lower() for keyword in off_topic_keywords):
-        response = {
-            "answer": "I'm focused on helping with your business procedures and operations. Please ask about your company's SOPs, policies, or general business questions.",
+        return jsonify({
+            "answer": "That's outside your company SOPs—please use the official help portal or ask about your internal procedures.",
             "source": "off_topic"
-        }
-        update_metrics(time.time() - start_time, "off_topic")
-        return jsonify(response)
+        })
 
     try:
-        # Determine query complexity for optimal model selection
-        complexity = get_query_complexity(qtext)
-        optimal_llm = get_optimal_llm(complexity)
+        # ENHANCED MULTI-STAGE RETRIEVAL
+        print(f"[QUERY] Processing: {qtext} for company: {tenant}")
         
-        print(f"[QUERY] Using {optimal_llm.model_name} for {complexity} query: {qtext[:50]}...")
-
-        # Set up retriever with company filtering
+        # Stage 1: Direct search with company filter
         retriever = vectorstore.as_retriever(
             search_kwargs={
-                "k": 7,  # More documents for better context
+                "k": 8,  # INCREASED from 5
                 "filter": {"company_id_slug": tenant}
             }
         )
         
-        # Create conversational chain with session memory
-        qa = ConversationalRetrievalChain.from_llm(
-            optimal_llm,
-            retriever=retriever,
-            memory=memory,
-            return_source_documents=True
-        )
+        # Expand query with synonyms for better matching
+        expanded_query = expand_query_with_synonyms(qtext)
+        print(f"[QUERY] Expanded query: {expanded_query}")
         
-        # Query the chain
-        result = qa.invoke({"question": qtext})
-        answer = clean_text(result.get("answer", ""))
-
-        # Check if answer is helpful
-        if is_unhelpful_answer(answer):
-            # Enhanced fallback with business context
-            try:
-                fallback_prompt = f"""
-                The user asked: "{qtext}"
-                
-                This is a business assistant for a company. Their company SOPs don't cover this specific topic, 
-                but provide a helpful, professional business response with general best practices, industry standards, 
-                or actionable guidance. Keep it concise but valuable. Focus on:
-                - Industry best practices
-                - Professional recommendations  
-                - Actionable steps
-                - Business-focused advice
-                
-                If it's about procedures they don't have documented, suggest they create documentation for it.
-                """
-                
-                fallback_llm = get_optimal_llm("medium")  # Use appropriate model for fallback
-                fallback = fallback_llm.invoke(fallback_prompt)
-                fallback_text = clean_text(getattr(fallback, "content", str(fallback)))
-                
-                response = {
-                    "answer": fallback_text,
-                    "fallback_used": True,
-                    "followups": [
-                        "Would you like me to help you create documentation for this?",
-                        "Do you want to know about related procedures?",
-                        "Need help with anything else?"
-                    ],
-                    "source": "business_fallback",
-                    "model_used": fallback_llm.model_name
-                }
-                
-                cache_response(qtext, tenant, response)
-                update_metrics(time.time() - start_time, "business_fallback")
-                return jsonify(response)
-                
-            except Exception as e:
-                print(f"[FALLBACK] Error: {e}")
-                response = {
-                    "answer": "I don't have specific information about that in your SOPs, but I'd be happy to help if you can provide more context or ask about other procedures I have access to.",
-                    "source": "no_info",
-                    "followups": generate_contextual_followups(qtext, "", previous_queries)
-                }
-                update_metrics(time.time() - start_time, "no_info")
-                return jsonify(response)
-
-        # Truncate long answers for voice
-        if len(answer.split()) > 80:
-            answer = "Here's a summary: " + " ".join(answer.split()[:70]) + "... For complete details, you can ask for more specifics."
-
-        response = {
-            "answer": answer,
-            "fallback_used": False,
-            "followups": generate_contextual_followups(qtext, answer, previous_queries),
-            "source": "sop",
-            "source_documents": len(result.get("source_documents", [])),
-            "model_used": optimal_llm.model_name,
-            "session_id": session_id
-        }
+        # Try to get documents
+        relevant_docs = retriever.get_relevant_documents(expanded_query)
         
-        # Cache successful responses
-        cache_response(qtext, tenant, response)
-        update_metrics(time.time() - start_time, "sop")
-        return jsonify(response)
+        if not relevant_docs:
+            print(f"[QUERY] No docs with company filter, trying without filter")
+            # Try without company filter
+            general_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+            relevant_docs = general_retriever.get_relevant_documents(expanded_query)
+        
+        print(f"[QUERY] Found {len(relevant_docs)} relevant documents")
+        
+        if relevant_docs:
+            # Create conversational chain
+            memory = ConversationBufferMemory(
+                memory_key="chat_history", 
+                return_messages=True,
+                output_key="answer"
+            )
+            
+            qa = ConversationalRetrievalChain.from_llm(
+                ChatOpenAI(temperature=0, model="gpt-4"),
+                retriever=vectorstore.as_retriever(search_kwargs={"k": len(relevant_docs)}),
+                memory=memory,
+                return_source_documents=True
+            )
+            
+            # Query the chain
+            result = qa.invoke({"question": expanded_query})
+            answer = clean_text(result.get("answer", ""))
+
+            # Enhanced answer validation
+            generic_phrases = ["i don't have", "i'm not sure", "sorry, i don't", "i cannot", "i'm unable"]
+            is_generic = any(phrase in answer.lower() for phrase in generic_phrases) if answer else True
+            
+            if answer and len(answer.split()) > 10 and not is_generic:
+                print(f"[QUERY] Success - found relevant answer")
+                
+                # Truncate long answers for TTS
+                if len(answer.split()) > 80:
+                    answer = "Here's a summary: " + " ".join(answer.split()[:70]) + "... For complete details, check your SOPs."
+               
+                # Get company voice (inline instead of COMPANY_VOICES)
+                company_voices = {
+                "chelco-3153": "Chelco Assistant: Professional and helpful.",
+                "demo_company_123": "Demo Assistant: Here to help with your questions.",
+                "demo-business-123": "Demo Business Assistant: Here to help with your questions."
+                }
+                company_voice = company_voices.get(tenant, "")
+                
+                
+                return jsonify({
+                    "answer": f"{company_voice} {answer}",
+                    "fallback_used": False,
+                    "followups": generate_contextual_followups(qtext, answer),
+                    "source": "sop",
+                    "source_documents": len(relevant_docs)
+                })
+
+        # Enhanced fallback
+        print(f"[QUERY] Using enhanced fallback")
+        
+        query_lower = qtext.lower()
+        if any(word in query_lower for word in ["angry", "upset", "customer"]):
+            fallback_answer = f"""I don't see specific customer service policies in your uploaded documents for {tenant.replace('-', ' ').title()}. 
+
+For handling difficult customers, here are general best practices:
+1. Listen actively and remain calm
+2. Acknowledge their concerns
+3. Apologize for any inconvenience  
+4. Focus on finding a solution
+5. Escalate to a manager if needed
+
+Please check your employee handbook or contact your supervisor for company-specific policies."""
+
+        elif any(word in query_lower for word in ["cash", "money", "refund"]):
+            fallback_answer = f"""I don't see specific financial procedures in your uploaded documents for {tenant.replace('-', ' ').title()}.
+
+For financial processes, please:
+1. Refer to your company's financial procedures manual
+2. Check with your manager for authorization limits
+3. Contact the accounting department for guidance
+
+Try asking about other topics from your uploaded company documents."""
+
+        else:
+            fallback_answer = f"""I don't see information about that in your company documents for {tenant.replace('-', ' ').title()}.
+
+This might be because:
+- The document hasn't been uploaded yet
+- It's covered under a different topic
+- It requires manager approval
+
+Try asking about procedures, policies, or customer service topics that might be in your uploaded documents."""
+        
+        return jsonify({
+            "answer": fallback_answer,
+            "fallback_used": True,
+            "followups": ["Can you be more specific?", "What department handles this?", "Try asking about a specific procedure"],
+            "source": "fallback"
+        })
 
     except Exception as e:
         print(f"[QUERY] Error: {e}")
-        # Better error handling
-        response = {
-            "answer": "I'm having trouble accessing the information right now. Please try rephrasing your question or ask about a different topic.",
-            "error": "Query processing failed", 
-            "source": "error",
-            "followups": ["Try asking about a specific procedure", "Rephrase your question", "Ask about available documents"]
-        }
-        update_metrics(time.time() - start_time, "error")
-        return jsonify(response)
+        return jsonify({"error": "Query failed", "details": str(e)}), 500
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
 def voice_reply():
