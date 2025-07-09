@@ -13,6 +13,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import secrets
 from datetime import datetime, timedelta
+import traceback
 
 load_dotenv()
 
@@ -58,14 +59,15 @@ vectorstore = None
 
 # ---- Flask Setup ----
 app = Flask(__name__)
-CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000"], supports_credentials=True)
+CORS(app, origins=["https://opsvoice-widget.vercel.app", "http://localhost:3000", "*"], supports_credentials=True)
 
 @app.after_request
 def add_cors(response):
     origin = request.headers.get("Origin", "")
     allowed_origins = ["https://opsvoice-widget.vercel.app", "http://localhost:3000"]
-    if origin in allowed_origins:
-        response.headers["Access-Control-Allow-Origin"] = origin
+    
+    # Allow all origins for debugging, but log them
+    response.headers["Access-Control-Allow-Origin"] = origin or "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -101,7 +103,7 @@ def validate_file_upload(file):
 
 def check_rate_limit_mvp(tenant: str) -> bool:
     """Simple rate limiting for MVP"""
-    global rate_limits  # ADD THIS LINE
+    global rate_limits
     
     current_minute = int(time.time() // 60)
     key = f"{tenant}:{current_minute}"
@@ -249,7 +251,7 @@ def get_optimal_llm(complexity: str) -> ChatOpenAI:
     
     if complexity == "simple":
         performance_metrics["model_usage"]["gpt-3.5-turbo"] += 1
-        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo")  # 2x faster
+        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
     else:
         performance_metrics["model_usage"]["gpt-4"] += 1
         return ChatOpenAI(temperature=0, model="gpt-4")
@@ -479,8 +481,8 @@ def home():
     return jsonify({
         "status": "ok", 
         "message": "🚀 OpsVoice RAG API is live!",
-        "version": "1.2.1-security-mvp",
-        "features": ["session_memory", "smart_truncation", "performance_optimization", "mvp_security"]
+        "version": "1.3.0-production",
+        "features": ["session_memory", "smart_truncation", "performance_optimization", "mvp_security", "n8n_compatible"]
     })
 
 @app.route("/healthz")
@@ -573,50 +575,95 @@ def upload_sop():
         print(f"[UPLOAD ERROR] {e}")
         return safe_error_mvp("Upload failed", 500)
 
-@app.route("/query", methods=["POST"])
+@app.route("/query", methods=["POST", "OPTIONS"])
 def query_sop():
-    """Enhanced query processing with session memory and performance optimization"""
+    """Enhanced query processing with n8n compatibility"""
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        return "", 204
+        
     start_time = time.time()
     
     try:
-        # More flexible request handling for backward compatibility
-        if not request.is_json:
-            # Try to get JSON anyway for backward compatibility
+        # Debug logging for n8n
+        print(f"[QUERY] Request headers: {dict(request.headers)}")
+        print(f"[QUERY] Content-Type: {request.content_type}")
+        print(f"[QUERY] Request data: {request.data[:200] if request.data else 'None'}")
+        
+        # Get JSON data with multiple fallbacks for n8n compatibility
+        payload = {}
+        
+        # Try standard JSON parsing
+        if request.is_json:
+            payload = request.get_json()
+        
+        # If that fails, try force parsing
+        if not payload:
             try:
-                payload = request.get_json(force=True) or {}
-            except:
-                return safe_error_mvp("Invalid request format", 400)
-        else:
-            payload = request.get_json() or {}
+                payload = request.get_json(force=True)
+            except Exception as e:
+                print(f"[QUERY] JSON parse error: {e}")
         
-        # Sanitize and validate inputs
-        qtext = sanitize_query_mvp(payload.get("query", ""))
+        # If still no payload, try parsing raw data
+        if not payload and request.data:
+            try:
+                payload = json.loads(request.data.decode('utf-8'))
+            except Exception as e:
+                print(f"[QUERY] Raw data parse error: {e}")
+        
+        # Final check
+        if not payload:
+            print("[QUERY] No payload found after all attempts")
+            return jsonify({
+                "error": "No data received",
+                "debug": {
+                    "content_type": request.content_type,
+                    "has_data": bool(request.data),
+                    "data_sample": request.data[:100].decode('utf-8', errors='ignore') if request.data else None
+                }
+            }), 400
+        
+        print(f"[QUERY] Parsed payload: {payload}")
+        
+        # Extract and validate inputs
+        qtext = sanitize_query_mvp(str(payload.get("query", "")))
         if not qtext or len(qtext.strip()) < 3:
-            return safe_error_mvp("Query too short", 400)
+            return jsonify({
+                "error": "Query too short",
+                "received_query": qtext
+            }), 400
         
-        tenant = payload.get("company_id_slug", "").strip()
+        tenant = str(payload.get("company_id_slug", "")).strip()
         if not validate_company_id_mvp(tenant):
-            return safe_error_mvp("Invalid company identifier", 400)
+            return jsonify({
+                "error": "Invalid company identifier",
+                "received_company_id": tenant
+            }), 400
         
         # Rate limiting
         if not check_rate_limit_mvp(tenant):
-            return safe_error_mvp("Too many requests - please wait a moment", 429)
+            return jsonify({
+                "error": "Too many requests - please wait a moment"
+            }), 429
         
         # Session management
-        # Make session_id optional for backward compatibility
         session_id = payload.get("session_id") or f"{tenant}_{int(time.time())}"
-        session_id = re.sub(r'[^a-zA-Z0-9_\-]', '', session_id)[:64]  # Sanitize session ID
+        session_id = re.sub(r'[^a-zA-Z0-9_\-\.]', '', str(session_id))[:64]
         
-        # Check cache first for performance
+        # Check cache first
         cached_response = get_cached_response(qtext, tenant)
         if cached_response:
-            cached_response["session_id"] = session_id  # Add session to cached response
+            cached_response["session_id"] = session_id
             update_metrics(time.time() - start_time, "cache")
             return jsonify(cached_response)
         
         # Ensure vectorstore is loaded
         if not ensure_vectorstore():
-            return safe_error_mvp("Service temporarily unavailable", 503)
+            return jsonify({
+                "error": "Service temporarily unavailable",
+                "answer": "The knowledge base is temporarily unavailable. Please try again in a moment.",
+                "source": "error"
+            }), 503
         
         # Check for vague queries
         if is_vague(qtext):
@@ -643,23 +690,22 @@ def query_sop():
         complexity = get_query_complexity(qtext)
         optimal_llm = get_optimal_llm(complexity)
         
-        # Make AI expansion optional with fallback
+        # Query expansion
         try:
-            expanded_query = intelligent_query_expansion(qtext)
-            print(f"[AI_EXPAND] Success: {qtext} -> {expanded_query[:50]}...")
+            expanded_query = expand_query_with_synonyms(qtext)
         except Exception as e:
-            print(f"[AI_EXPAND] Failed ({e}), using original query")
+            print(f"[QUERY] Expansion failed: {e}")
             expanded_query = qtext
 
         # Set up retriever with company filtering
         retriever = vectorstore.as_retriever(
             search_kwargs={
-                "k": 5,  # Reduced for performance
+                "k": 5,
                 "filter": {"company_id_slug": tenant}
             }
         )
         
-        # Get session memory for conversation context
+        # Get session memory
         memory = get_session_memory(session_id)
         
         # Create conversational chain
@@ -676,12 +722,12 @@ def query_sop():
 
         # Check if answer is helpful
         if answer and not is_unhelpful_answer(answer):
-            # Smart truncation that preserves complete sentences
+            # Smart truncation
             if len(answer.split()) > 150:
                 answer = smart_truncate(answer, 150)
            
             response = {
-                "answer": answer,  # Clean response without company prefix
+                "answer": answer,
                 "fallback_used": False,
                 "followups": generate_contextual_followups(qtext, answer),
                 "source": "sop",
@@ -699,7 +745,7 @@ def query_sop():
             # Enhanced fallback
             query_lower = qtext.lower()
             if any(word in query_lower for word in ["angry", "upset", "customer"]):
-                fallback_answer = f"""I don't see specific customer service policies in your uploaded documents for {tenant.replace('-', ' ').title()}. 
+                fallback_answer = """I don't see specific customer service policies in your uploaded documents. 
 
 For handling difficult customers, here are general best practices:
 1. Listen actively and remain calm
@@ -711,7 +757,7 @@ For handling difficult customers, here are general best practices:
 Please check your employee handbook or contact your supervisor for company-specific policies."""
 
             elif any(word in query_lower for word in ["cash", "money", "refund"]):
-                fallback_answer = f"""I don't see specific financial procedures in your uploaded documents for {tenant.replace('-', ' ').title()}.
+                fallback_answer = """I don't see specific financial procedures in your uploaded documents.
 
 For financial processes, please:
 1. Refer to your company's financial procedures manual
@@ -721,7 +767,7 @@ For financial processes, please:
 Try asking about other topics from your uploaded company documents."""
 
             else:
-                fallback_answer = f"""I don't see information about that in your company documents for {tenant.replace('-', ' ').title()}.
+                fallback_answer = """I don't see information about that in your company documents.
 
 This might be because:
 - The document hasn't been uploaded yet
@@ -742,49 +788,63 @@ Try asking about procedures, policies, or customer service topics that might be 
             return jsonify(response)
 
     except Exception as e:
-        print(f"[QUERY ERROR] {e}")
-        return safe_error_mvp("Query processing failed", 500)
+        print(f"[QUERY ERROR] Full trace: {traceback.format_exc()}")
+        return jsonify({
+            "error": "Query processing failed",
+            "answer": "I encountered an error processing your request. Please try again.",
+            "source": "error",
+            "debug": str(e)
+        }), 500
+
+@app.route("/debug-request", methods=["POST"])
+def debug_request():
+    """Debug endpoint to see what n8n is sending"""
+    return jsonify({
+        "headers": dict(request.headers),
+        "content_type": request.content_type,
+        "is_json": request.is_json,
+        "data": request.data.decode() if request.data else None,
+        "json": request.get_json(force=True, silent=True),
+        "form": dict(request.form) if request.form else None,
+        "args": dict(request.args) if request.args else None
+    })
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
 def voice_reply():
     """Convert text to speech with enhanced security and caching"""
     # Handle CORS preflight
     if request.method == "OPTIONS":
-        response = make_response()
-        response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "")
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        return response
+        return "", 204
 
     try:
-        # More flexible request handling for backward compatibility
-        if not request.is_json:
-            # Try to get JSON anyway for backward compatibility
-            try:
-                data = request.get_json(force=True) or {}
-            except:
-                return safe_error_mvp("Invalid request format", 400)
+        # More flexible request handling
+        payload = {}
+        if request.is_json:
+            payload = request.get_json()
         else:
-            data = request.get_json() or {}
+            try:
+                payload = request.get_json(force=True)
+            except:
+                payload = {}
         
         # Extract and validate text
-        text = data.get("text", "").strip()
+        text = payload.get("text", "").strip()
         if not text:
-            return safe_error_mvp("Missing text parameter", 400)
+            return jsonify({"error": "Missing text parameter"}), 400
         
         # Clean text for TTS
         text = clean_text(text)
         if not text:
-            return safe_error_mvp("Text too short after cleaning", 400)
+            return jsonify({"error": "Text too short after cleaning"}), 400
         
         # Validate company ID
-        tenant = data.get("company_id_slug", "").strip()
+        tenant = payload.get("company_id_slug", "").strip()
         if tenant and not validate_company_id_mvp(tenant):
-            return safe_error_mvp("Invalid company identifier", 400)
+            return jsonify({"error": "Invalid company identifier"}), 400
         
         # Rate limiting for TTS
         if tenant and not check_rate_limit_mvp(tenant):
-            return safe_error_mvp("Too many requests - please wait a moment", 429)
+            return jsonify({"error": "Too many requests - please wait a moment"}), 429
         
         # Limit text length for TTS (cost control)
         tts_text = text[:500] if len(text) > 500 else text
@@ -801,7 +861,7 @@ def voice_reply():
         # Generate new audio with API key from environment
         elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
         if not elevenlabs_key:
-            return safe_error_mvp("TTS service not configured", 503)
+            return jsonify({"error": "TTS service not configured"}), 503
         
         tts_resp = requests.post(
             "https://api.elevenlabs.io/v1/text-to-speech/tnSpp4vdxKPjI9w0GnoV/stream",
@@ -822,7 +882,7 @@ def voice_reply():
         )
         
         if tts_resp.status_code != 200:
-            return safe_error_mvp("TTS service error", 502)
+            return jsonify({"error": "TTS service error"}), 502
         
         # Cache the audio
         audio_data = tts_resp.content
@@ -832,10 +892,10 @@ def voice_reply():
         return send_file(io.BytesIO(audio_data), mimetype="audio/mp3", as_attachment=False)
         
     except requests.exceptions.Timeout:
-        return safe_error_mvp("TTS request timeout", 504)
+        return jsonify({"error": "TTS request timeout"}), 504
     except Exception as e:
         print(f"[TTS ERROR] {e}")
-        return safe_error_mvp("TTS request failed", 500)
+        return jsonify({"error": "TTS request failed"}), 500
 
 @app.route("/sop-status")
 def sop_status():
@@ -849,7 +909,7 @@ def company_docs(company_id_slug):
     """Get documents for a specific company with security validation"""
     # Validate company ID
     if not validate_company_id_mvp(company_id_slug):
-        return safe_error_mvp("Invalid company identifier", 400)
+        return jsonify({"error": "Invalid company identifier"}), 400
     
     if not os.path.exists(STATUS_FILE): 
         return jsonify([])
@@ -875,7 +935,7 @@ def company_docs(company_id_slug):
         
     except Exception as e:
         print(f"[DOCS] Error: {e}")
-        return safe_error_mvp("Failed to fetch documents", 500)
+        return jsonify({"error": "Failed to fetch documents"}), 500
 
 @app.route("/lookup-slug")
 def lookup_slug():
@@ -884,10 +944,10 @@ def lookup_slug():
     
     # Basic email validation
     if not email or '@' not in email or len(email) < 5:
-        return safe_error_mvp("Invalid email", 400)
+        return jsonify({"error": "Invalid email"}), 400
     
     if not os.path.exists(STATUS_FILE):
-        return safe_error_mvp("No data available", 404)
+        return jsonify({"error": "No data available"}), 404
 
     try:
         data = json.load(open(STATUS_FILE))
@@ -898,7 +958,7 @@ def lookup_slug():
         return jsonify({"error": "Not found"}), 404
     except Exception as e:
         print(f"[LOOKUP] Error: {e}")
-        return safe_error_mvp("Lookup failed", 500)
+        return jsonify({"error": "Lookup failed"}), 500
 
 @app.route("/reload-db", methods=["POST"])
 def reload_db():
@@ -929,7 +989,7 @@ def clear_cache():
             "audio_files_cleared": audio_files_cleared
         })
     except Exception as e:
-        return safe_error_mvp("Cache clear failed", 500)
+        return jsonify({"error": "Cache clear failed"}), 500
 
 @app.route("/clear-sessions", methods=["POST"])
 def clear_sessions():
@@ -945,7 +1005,7 @@ def clear_sessions():
 def get_session_info(session_id):
     """Get information about a conversation session"""
     # Sanitize session ID
-    session_id = re.sub(r'[^a-zA-Z0-9_\-]', '', session_id)[:64]
+    session_id = re.sub(r'[^a-zA-Z0-9_\-\.]', '', session_id)[:64]
     
     if session_id in conversation_sessions:
         memory = conversation_sessions[session_id]
@@ -965,22 +1025,27 @@ def get_session_info(session_id):
 def continue_conversation():
     """Explicitly continue from where we left off"""
     try:
-        if not request.is_json:
-            return safe_error_mvp("Invalid request format", 400)
+        payload = {}
+        if request.is_json:
+            payload = request.get_json()
+        else:
+            try:
+                payload = request.get_json(force=True)
+            except:
+                payload = {}
         
-        payload = request.get_json() or {}
         session_id = payload.get("session_id", "").strip()
         tenant = payload.get("company_id_slug", "").strip()
         
         # Validate inputs
         if not session_id or not validate_company_id_mvp(tenant):
-            return safe_error_mvp("Invalid session or company identifier", 400)
+            return jsonify({"error": "Invalid session or company identifier"}), 400
         
         # Sanitize session ID
-        session_id = re.sub(r'[^a-zA-Z0-9_\-]', '', session_id)[:64]
+        session_id = re.sub(r'[^a-zA-Z0-9_\-\.]', '', session_id)[:64]
         
         if session_id not in conversation_sessions:
-            return safe_error_mvp("No conversation session found", 400)
+            return jsonify({"error": "No conversation session found"}), 400
         
         memory = conversation_sessions[session_id]
         
@@ -1002,7 +1067,7 @@ def continue_conversation():
                     "session_id": session_id
                 }
                 
-                # Call query endpoint internally (this preserves session context)
+                # Call query endpoint internally
                 with app.test_request_context('/query', json=continue_payload, method='POST'):
                     return query_sop()
             else:
@@ -1020,7 +1085,43 @@ def continue_conversation():
             
     except Exception as e:
         print(f"[CONTINUE ERROR] {e}")
-        return safe_error_mvp("Continue failed", 500)
+        return jsonify({"error": "Continue failed"}), 500
+
+@app.route("/force-embed-demo", methods=["POST"])
+def force_embed_demo():
+    """Force embed all files for demo-business-123"""
+    try:
+        all_files = glob.glob(os.path.join(SOP_FOLDER, "*.pdf")) + glob.glob(os.path.join(SOP_FOLDER, "*.docx"))
+        
+        if not all_files:
+            return jsonify({"message": "No files found", "sop_folder": SOP_FOLDER})
+        
+        embedded_count = 0
+        for file_path in all_files:
+            filename = os.path.basename(file_path)
+            title = filename.rsplit('.', 1)[0]
+            
+            metadata = {
+                "title": title,
+                "company_id_slug": "demo-business-123", 
+                "filename": filename,
+                "uploaded_at": time.time(),
+                "file_size": os.path.getsize(file_path)
+            }
+            
+            print(f"[FORCE-EMBED] {filename} -> demo-business-123")
+            update_status(filename, {"status": "force-embedding...", **metadata})
+            Thread(target=embed_sop_worker, args=(file_path, metadata), daemon=True).start()
+            embedded_count += 1
+        
+        return jsonify({
+            "message": f"Started embedding {embedded_count} files for demo-business-123",
+            "files": [os.path.basename(f) for f in all_files]
+        })
+        
+    except Exception as e:
+        print(f"[FORCE-EMBED ERROR] {e}")
+        return jsonify({"error": "Force embedding failed"}), 500
 
 # Simple memory cleanup - runs every 100 requests
 request_counter = 0
@@ -1044,15 +1145,15 @@ def before_request():
 # Error handlers
 @app.errorhandler(404)
 def not_found(error):
-    return safe_error_mvp("Endpoint not found", 404)
+    return jsonify({"error": "Endpoint not found"}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return safe_error_mvp("Internal server error", 500)
+    return jsonify({"error": "Internal server error"}), 500
 
 @app.errorhandler(413)
 def too_large(error):
-    return safe_error_mvp("File too large", 413)
+    return jsonify({"error": "File too large"}), 413
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
@@ -1061,8 +1162,8 @@ if __name__ == "__main__":
     print("[STARTUP] Loading vector store...")
     load_vectorstore()
     
-    print(f"[STARTUP] Starting Security MVP OpsVoice API v1.2.1 on port {port}")
-    print(f"[STARTUP] Features: Session Memory, Smart Truncation, Performance Optimization, MVP Security")
+    print(f"[STARTUP] Starting Production OpsVoice API v1.3.0 on port {port}")
+    print(f"[STARTUP] Features: Session Memory, Smart Truncation, Performance Optimization, MVP Security, n8n Compatibility")
     print(f"[STARTUP] Security: File validation, Rate limiting, Input sanitization, Safe errors")
     print(f"[STARTUP] Target response time: 3-5 seconds")
     app.run(host="0.0.0.0", port=port, debug=False)
