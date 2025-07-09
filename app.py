@@ -577,155 +577,105 @@ def upload_sop():
 
 @app.route("/query", methods=["POST", "OPTIONS"])
 def query_sop():
-    """Enhanced query processing with n8n compatibility"""
-    # Handle CORS preflight
+    """Enhanced query processing with widget/n8n compatibility for voice and text Ask"""
     if request.method == "OPTIONS":
         return "", 204
         
     start_time = time.time()
-    
     try:
-        # Debug logging for n8n
-        print(f"[QUERY] Request headers: {dict(request.headers)}")
-        print(f"[QUERY] Content-Type: {request.content_type}")
-        print(f"[QUERY] Request data: {request.data[:200] if request.data else 'None'}")
-        
-        # Get JSON data with multiple fallbacks for n8n compatibility
         payload = {}
-        
-        # Try standard JSON parsing
         if request.is_json:
             payload = request.get_json()
-        
-        # If that fails, try force parsing
         if not payload:
-            try:
-                payload = request.get_json(force=True)
-            except Exception as e:
-                print(f"[QUERY] JSON parse error: {e}")
-        
-        # If still no payload, try parsing raw data
+            try: payload = request.get_json(force=True)
+            except: pass
         if not payload and request.data:
-            try:
-                payload = json.loads(request.data.decode('utf-8'))
-            except Exception as e:
-                print(f"[QUERY] Raw data parse error: {e}")
-        
-        # Final check
+            try: payload = json.loads(request.data.decode('utf-8'))
+            except: pass
+
         if not payload:
             print("[QUERY] No payload found after all attempts")
-            return jsonify({
-                "error": "No data received",
-                "debug": {
-                    "content_type": request.content_type,
-                    "has_data": bool(request.data),
-                    "data_sample": request.data[:100].decode('utf-8', errors='ignore') if request.data else None
-                }
-            }), 400
+            return jsonify({"error": "No data received"}), 400
         
-        print(f"[QUERY] Parsed payload: {payload}")
-        
-        # Extract and validate inputs
         qtext = sanitize_query_mvp(str(payload.get("query", "")))
-        if not qtext or len(qtext.strip()) < 3:
-            return jsonify({
-                "error": "Query too short",
-                "received_query": qtext
-            }), 400
-        
         tenant = str(payload.get("company_id_slug", "")).strip()
-        if not validate_company_id_mvp(tenant):
-            return jsonify({
-                "error": "Invalid company identifier",
-                "received_company_id": tenant
-            }), 400
-        
-        # Rate limiting
-        if not check_rate_limit_mvp(tenant):
-            return jsonify({
-                "error": "Too many requests - please wait a moment"
-            }), 429
-        
-        # Session management
         session_id = payload.get("session_id") or f"{tenant}_{int(time.time())}"
         session_id = re.sub(r'[^a-zA-Z0-9_\-\.]', '', str(session_id))[:64]
-        
-        # Check cache first
+
+        # Check/validate input
+        if not qtext or len(qtext.strip()) < 3:
+            return jsonify({"answer": "Please type a longer question.", "source": "error", "followups": []}), 400
+        if not validate_company_id_mvp(tenant):
+            return jsonify({"answer": "Missing or invalid company.", "source": "error", "followups": []}), 400
+        if not check_rate_limit_mvp(tenant):
+            return jsonify({"answer": "Too many requests. Wait and try again.", "source": "error", "followups": []}), 429
+
+        # 1. Check cache first
         cached_response = get_cached_response(qtext, tenant)
         if cached_response:
             cached_response["session_id"] = session_id
             update_metrics(time.time() - start_time, "cache")
             return jsonify(cached_response)
-        
-        # Ensure vectorstore is loaded
+
+        # 2. Ensure vectorstore is loaded
         if not ensure_vectorstore():
             return jsonify({
-                "error": "Service temporarily unavailable",
-                "answer": "The knowledge base is temporarily unavailable. Please try again in a moment.",
-                "source": "error"
+                "answer": "Service temporarily unavailable. Try again shortly.",
+                "source": "error",
+                "followups": []
             }), 503
-        
-        # Check for vague queries
+
+        # 3. Handle vague queries
         if is_vague(qtext):
             response = {
                 "answer": "Please provide more specific details about what you're looking for.",
                 "source": "clarify",
+                "followups": ["Can you describe your task more clearly?"],
                 "session_id": session_id
             }
             update_metrics(time.time() - start_time, "clarify")
             return jsonify(response)
-        
-        # Filter out completely off-topic queries
+
+        # 4. Filter off-topic queries
         off_topic_keywords = ["gmail", "facebook", "amazon", "weather", "news", "stock", "crypto"]
         if any(keyword in qtext.lower() for keyword in off_topic_keywords):
             response = {
                 "answer": "Please ask questions related to your company procedures and policies.",
                 "source": "off_topic",
+                "followups": ["Ask about procedures", "Ask about training"],
                 "session_id": session_id
             }
             update_metrics(time.time() - start_time, "off_topic")
             return jsonify(response)
-        
-        # Performance optimization - select optimal model
+
+        # 5. RAG Model selection and query
         complexity = get_query_complexity(qtext)
         optimal_llm = get_optimal_llm(complexity)
-        
-        # Query expansion
         try:
             expanded_query = expand_query_with_synonyms(qtext)
         except Exception as e:
             print(f"[QUERY] Expansion failed: {e}")
             expanded_query = qtext
 
-        # Set up retriever with company filtering
         retriever = vectorstore.as_retriever(
             search_kwargs={
                 "k": 5,
                 "filter": {"company_id_slug": tenant}
             }
         )
-        
-        # Get session memory
         memory = get_session_memory(session_id)
-        
-        # Create conversational chain
         qa = ConversationalRetrievalChain.from_llm(
             optimal_llm,
             retriever=retriever,
             memory=memory,
             return_source_documents=True
         )
-        
-        # Query the chain
         result = qa.invoke({"question": expanded_query})
         answer = clean_text(result.get("answer", ""))
 
-        # Check if answer is helpful
         if answer and not is_unhelpful_answer(answer):
-            # Smart truncation
             if len(answer.split()) > 150:
                 answer = smart_truncate(answer, 150)
-           
             response = {
                 "answer": answer,
                 "fallback_used": False,
@@ -735,47 +685,17 @@ def query_sop():
                 "session_id": session_id,
                 "model_used": optimal_llm.model_name
             }
-            
-            # Cache successful responses
             cache_response(qtext, tenant, response)
             update_metrics(time.time() - start_time, "sop")
             return jsonify(response)
-        
         else:
-            # Enhanced fallback
-            query_lower = qtext.lower()
-            if any(word in query_lower for word in ["angry", "upset", "customer"]):
-                fallback_answer = """I don't see specific customer service policies in your uploaded documents. 
-
-For handling difficult customers, here are general best practices:
-1. Listen actively and remain calm
-2. Acknowledge their concerns
-3. Apologize for any inconvenience  
-4. Focus on finding a solution
-5. Escalate to a manager if needed
-
-Please check your employee handbook or contact your supervisor for company-specific policies."""
-
-            elif any(word in query_lower for word in ["cash", "money", "refund"]):
-                fallback_answer = """I don't see specific financial procedures in your uploaded documents.
-
-For financial processes, please:
-1. Refer to your company's financial procedures manual
-2. Check with your manager for authorization limits
-3. Contact the accounting department for guidance
-
-Try asking about other topics from your uploaded company documents."""
-
-            else:
-                fallback_answer = """I don't see information about that in your company documents.
-
+            # fallback (show text, followups always)
+            fallback_answer = """I don't see information about that in your company documents.
 This might be because:
 - The document hasn't been uploaded yet
 - It's covered under a different topic
 - It requires manager approval
-
 Try asking about procedures, policies, or customer service topics that might be in your uploaded documents."""
-            
             response = {
                 "answer": fallback_answer,
                 "fallback_used": True,
@@ -783,16 +703,15 @@ Try asking about procedures, policies, or customer service topics that might be 
                 "source": "fallback",
                 "session_id": session_id
             }
-            
             update_metrics(time.time() - start_time, "fallback")
             return jsonify(response)
 
     except Exception as e:
         print(f"[QUERY ERROR] Full trace: {traceback.format_exc()}")
         return jsonify({
-            "error": "Query processing failed",
-            "answer": "I encountered an error processing your request. Please try again.",
+            "answer": "Error processing your request. Please try again.",
             "source": "error",
+            "followups": [],
             "debug": str(e)
         }), 500
 
