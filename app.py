@@ -3,6 +3,7 @@ import os, glob, json, re, time, io, shutil, requests, hashlib
 from dotenv import load_dotenv
 from threading import Thread
 from functools import lru_cache
+from collections import OrderedDict
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -48,9 +49,6 @@ os.makedirs(SOP_FOLDER, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
-# ❌ REMOVED: The data-wiping startup code that was causing data loss!
-# NO MORE: shutil.rmtree(CHROMA_DIR) on startup
-
 # Performance tracking
 performance_metrics = {
     "total_queries": 0,
@@ -60,12 +58,32 @@ performance_metrics = {
     "response_sources": {"sop": 0, "fallback": 0, "cache": 0, "error": 0, "general_business": 0}
 }
 
-# Enhanced caching
-query_cache = {}
+# Enhanced caching with LRU
+class LRUCache(OrderedDict):
+    def __init__(self, maxsize=500):
+        self.maxsize = maxsize
+        super().__init__()
+    
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            oldest = next(iter(self))
+            del self[oldest]
+    
+    def get(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
 
-# Initialize embeddings and vectorstore
+query_cache = LRUCache(MAX_CACHE_SIZE)
+
+# Initialize embeddings and persistent vectorstore
 embedding = OpenAIEmbeddings()
 vectorstore = None
+vectorstore_last_health_check = 0
 
 # ---- Flask Setup ----
 app = Flask(__name__)
@@ -281,20 +299,26 @@ def get_session_memory(session_id):
 def get_query_complexity(query: str) -> str:
     """Determine query complexity for model selection"""
     words = query.lower().split()
+    word_count = len(words)
     
+    # Simple queries: short, basic questions
     simple_indicators = [
-        len(words) <= 8,
-        any(word in query.lower() for word in ['what', 'when', 'where', 'who', 'how many']),
-        query.endswith('?') and len(words) <= 6
+        word_count <= 8,
+        any(word in query.lower() for word in ['what', 'when', 'where', 'who', 'how many', 'is there']),
+        query.endswith('?') and word_count <= 6,
+        bool(re.match(r'^(what|where|when|who|how much|how many|is there|do we have)', query.lower()))
     ]
     
+    # Complex queries: multi-part, analytical, or detailed
     complex_indicators = [
-        len(words) > 15,
-        any(word in query.lower() for word in ['analyze', 'compare', 'explain why', 'walk me through']),
-        query.count('?') > 1
+        word_count > 15,
+        any(word in query.lower() for word in ['analyze', 'compare', 'explain why', 'walk me through', 'detailed', 'comprehensive']),
+        query.count('?') > 1,
+        query.count(',') > 2,
+        any(word in query.lower() for word in ['and also', 'in addition', 'furthermore', 'moreover'])
     ]
     
-    if sum(complex_indicators) > 0:
+    if sum(complex_indicators) >= 2:
         return "complex"
     elif sum(simple_indicators) >= 2:
         return "simple"
@@ -307,10 +331,10 @@ def get_optimal_llm(complexity: str) -> ChatOpenAI:
     
     if complexity == "simple":
         performance_metrics["model_usage"]["gpt-3.5-turbo"] += 1
-        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo", request_timeout=30)
     else:
         performance_metrics["model_usage"]["gpt-4"] += 1
-        return ChatOpenAI(temperature=0, model="gpt-4")
+        return ChatOpenAI(temperature=0, model="gpt-4", request_timeout=45)
 
 def get_cache_key(query: str, company_id: str) -> str:
     """Generate secure cache key"""
@@ -330,18 +354,12 @@ def get_cached_response(query: str, company_id: str) -> dict:
     return None
 
 def cache_response(query: str, company_id: str, response: dict):
-    """Cache response with size management"""
+    """Cache response with LRU eviction"""
     cache_key = get_cache_key(query, company_id)
     query_cache[cache_key] = {
         'response': response,
         'timestamp': time.time()
     }
-    
-    # Manage cache size
-    if len(query_cache) > MAX_CACHE_SIZE:
-        oldest_keys = sorted(query_cache.keys(), key=lambda k: query_cache[k]['timestamp'])[:100]
-        for key in oldest_keys:
-            del query_cache[key]
 
 def update_metrics(response_time: float, source: str):
     """Update performance metrics"""
@@ -371,6 +389,123 @@ def is_unhelpful_answer(text):
     
     return has_trigger or is_too_short
 
+def analyze_query_intent_with_llm(query: str, company_name: str) -> str:
+    """Use LLM to analyze query intent and categorize it"""
+    try:
+        intent_prompt = f"""
+        Analyze this business query and categorize it: "{query}"
+        
+        Categories: customer_service, financial_procedures, hr_onboarding, daily_operations, 
+        safety_emergency, sales_process, inventory_management, quality_compliance, 
+        marketing_communication, technology_it, general_business
+        
+        Respond with ONLY the category name.
+        """
+        
+        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        response = llm.invoke(intent_prompt)
+        
+        category = response.content.strip().lower()
+        valid_categories = ["customer_service", "financial_procedures", "hr_onboarding", 
+                          "daily_operations", "safety_emergency", "sales_process", 
+                          "inventory_management", "quality_compliance", "marketing_communication", 
+                          "technology_it", "general_business"]
+        
+        if category in valid_categories:
+            return category
+        else:
+            return "general_business"
+            
+    except Exception as e:
+        logger.error(f"Intent analysis error: {e}")
+        return "general_business"
+
+def generate_fallback_response(query: str, company_name: str, query_category: str) -> str:
+    """Generate intelligent fallback response based on query category"""
+    category_prompts = {
+        "customer_service": """
+        Provide best practices for handling customer service situations, including:
+        - De-escalation techniques
+        - Active listening strategies
+        - Problem resolution steps
+        - When to involve management
+        """,
+        "financial_procedures": """
+        Explain standard financial procedures and controls:
+        - Cash handling best practices
+        - Transaction documentation
+        - Approval hierarchies
+        - Audit trail maintenance
+        """,
+        "hr_onboarding": """
+        Outline effective employee onboarding practices:
+        - First day/week checklist
+        - Essential paperwork
+        - Training schedules
+        - Mentorship programs
+        """,
+        "daily_operations": """
+        Describe operational best practices:
+        - Opening/closing procedures
+        - Task prioritization
+        - Team communication
+        - Efficiency optimization
+        """,
+        "safety_emergency": """
+        Detail emergency response protocols:
+        - Emergency contact procedures
+        - Evacuation protocols
+        - First aid basics
+        - Incident reporting
+        """,
+        "sales_process": """
+        Explain effective sales techniques:
+        - Customer engagement
+        - Needs assessment
+        - Solution presentation
+        - Closing strategies
+        """,
+        "inventory_management": """
+        Describe inventory control best practices:
+        - Stock tracking methods
+        - Reorder points
+        - Loss prevention
+        - Organization systems
+        """,
+        "general_business": """
+        Provide general business guidance and best practices.
+        """
+    }
+    
+    try:
+        base_prompt = category_prompts.get(query_category, category_prompts["general_business"])
+        
+        fallback_prompt = f"""
+        A user from {company_name} asked: "{query}"
+        
+        Since I don't have their specific company procedures, provide general business best practices.
+        
+        {base_prompt}
+        
+        Start with: "I don't see specific procedures for {company_name}, but here's general business best practice:"
+        
+        Make it practical, actionable, and conversational. Limit to 2-3 paragraphs.
+        """
+        
+        llm = ChatOpenAI(temperature=0.3, model="gpt-3.5-turbo")
+        response = llm.invoke(fallback_prompt)
+        
+        return clean_text(response.content)
+        
+    except Exception as e:
+        logger.error(f"Fallback response error: {e}")
+        return f"""I don't see specific procedures for {company_name}, but here's general business best practice:
+
+For most business situations, focus on clear communication, documentation, and following established hierarchies. 
+Listen carefully to understand the full situation, document important details, and escalate to management when needed.
+
+Would you like me to help you find your company's specific procedures?"""
+
 # ---- ENHANCED: General Business Intelligence System ----
 def get_general_business_response(query: str, company_id: str = None) -> dict:
     """
@@ -378,9 +513,15 @@ def get_general_business_response(query: str, company_id: str = None) -> dict:
     Works even when no company documents are uploaded
     """
     try:
+        # Analyze query intent
+        company_name = company_id.replace('-', ' ').replace('_', ' ').title() if company_id else "your company"
+        query_category = analyze_query_intent_with_llm(query, company_name)
+        
         # Create a comprehensive business prompt
         business_prompt = f"""
         You are an expert business consultant and advisor. A user asked: "{query}"
+        
+        This appears to be a {query_category.replace('_', ' ')} question.
         
         Provide a helpful, professional business response that includes:
         1. Direct answer to their question with practical advice
@@ -400,7 +541,7 @@ def get_general_business_response(query: str, company_id: str = None) -> dict:
         
         # Generate contextual follow-ups for business topics
         followup_prompt = f"""
-        Based on this business question: "{query}"
+        Based on this {query_category.replace('_', ' ')} question: "{query}"
         
         Generate 3 relevant follow-up questions someone might ask related to this topic.
         Make them practical and actionable. Return as a simple list.
@@ -416,7 +557,8 @@ def get_general_business_response(query: str, company_id: str = None) -> dict:
                 "How do I implement this in my business?",
                 "What are common mistakes to avoid?"
             ],
-            "source": "general_business_intelligence"
+            "source": "general_business_intelligence",
+            "category": query_category
         }
         
     except Exception as e:
@@ -774,16 +916,29 @@ def load_vectorstore():
         vectorstore = None
 
 def ensure_vectorstore():
-    """Ensure vectorstore is available"""
-    global vectorstore
-    try:
-        if not vectorstore:
+    """Ensure vectorstore is available with health checks"""
+    global vectorstore, vectorstore_last_health_check
+    
+    # Health check every 5 minutes
+    current_time = time.time()
+    if current_time - vectorstore_last_health_check > 300:  # 5 minutes
+        try:
+            if vectorstore:
+                # Test the connection
+                test_results = vectorstore.similarity_search("health_check", k=1)
+                vectorstore_last_health_check = current_time
+                return True
+            else:
+                load_vectorstore()
+                vectorstore_last_health_check = current_time
+                return vectorstore is not None
+        except Exception as e:
+            logger.error(f"Vectorstore health check failed: {e}")
             load_vectorstore()
-        return vectorstore is not None
-    except Exception as e:
-        logger.error(f"Vectorstore health check failed: {e}")
-        load_vectorstore()
-        return vectorstore is not None
+            vectorstore_last_health_check = current_time
+            return vectorstore is not None
+    
+    return vectorstore is not None
 
 def get_company_documents_internal(company_id_slug):
     """Get documents for a company"""
@@ -823,10 +978,23 @@ def home():
     return safe_json_response({
         "status": "ok", 
         "message": "🚀 OpsVoice RAG API is live!",
-        "version": "2.0.0-production-enhanced",
-        "features": ["data_persistence", "general_business_intelligence", "session_memory", "smart_truncation", "security_enhanced", "demo_ready"],
+        "version": "3.0.0-performance-optimized",
+        "features": [
+            "smart_model_selection",
+            "intelligent_caching", 
+            "persistent_vectorstore",
+            "smart_truncation",
+            "llm_based_fallback",
+            "general_business_intelligence",
+            "session_memory",
+            "performance_tracking"
+        ],
         "data_path": DATA_PATH,
-        "persistent_storage": os.path.exists("/data")
+        "persistent_storage": os.path.exists("/data"),
+        "performance": {
+            "cache_hit_rate": f"{(performance_metrics['cache_hits'] / max(1, performance_metrics['total_queries']) * 100):.1f}%",
+            "avg_response_time": f"{performance_metrics['avg_response_time']:.2f}s"
+        }
     })
 
 @app.route("/healthz")
@@ -939,7 +1107,7 @@ def upload_sop():
 
 @app.route("/query", methods=["POST", "OPTIONS"])
 def query_sop():
-    """ENHANCED query processing with general business intelligence and company document search"""
+    """ENHANCED query processing with performance optimizations"""
     if request.method == "OPTIONS":
         return "", 204
         
@@ -988,10 +1156,12 @@ def query_sop():
                 "session_id": session_id
             }, 429)
 
-        # Check cache first
+        # PERFORMANCE OPTIMIZATION: Check cache first
         cached_response = get_cached_response(qtext, tenant)
         if cached_response:
             cached_response["session_id"] = session_id
+            cached_response["cache_hit"] = True
+            cached_response["response_time"] = round(time.time() - start_time, 2)
             update_metrics(time.time() - start_time, "cache")
             return safe_json_response(cached_response)
 
@@ -1001,6 +1171,7 @@ def query_sop():
             logger.warning("Vectorstore unavailable, using general business intelligence")
             general_response = get_general_business_response(qtext, tenant)
             general_response["session_id"] = session_id
+            general_response["response_time"] = round(time.time() - start_time, 2)
             performance_metrics["response_sources"]["general_business"] += 1
             update_metrics(time.time() - start_time, "general_business")
             return safe_json_response(general_response)
@@ -1011,7 +1182,8 @@ def query_sop():
                 "answer": "Could you please be more specific? What procedure or policy are you looking for?",
                 "source": "clarify",
                 "followups": ["How do I handle customer complaints?", "What's the refund procedure?", "Where are the training documents?"],
-                "session_id": session_id
+                "session_id": session_id,
+                "response_time": round(time.time() - start_time, 2)
             }
             update_metrics(time.time() - start_time, "clarify")
             return safe_json_response(response)
@@ -1023,7 +1195,8 @@ def query_sop():
                 "answer": "Please ask questions about your company procedures and policies.",
                 "source": "off_topic",
                 "followups": ["What are our customer service procedures?", "How do I process a refund?", "What's the onboarding process?"],
-                "session_id": session_id
+                "session_id": session_id,
+                "response_time": round(time.time() - start_time, 2)
             }
             update_metrics(time.time() - start_time, "off_topic")
             return safe_json_response(response)
@@ -1032,104 +1205,122 @@ def query_sop():
         company_docs = get_company_documents_internal(tenant)
         has_company_docs = len(company_docs) > 0
 
-        # Process with RAG or General Business Intelligence
-        try:
-            complexity = get_query_complexity(qtext)
-            optimal_llm = get_optimal_llm(complexity)
-            expanded_query = expand_query_with_synonyms(qtext)
-            
-            logger.info(f"Processing query for {tenant}: {qtext[:50]}... (complexity: {complexity}, has_docs: {has_company_docs})")
-            
-            company_answer = None
-            
-            if has_company_docs:
-                # Try company-specific documents first
-                try:
-                    retriever = vectorstore.as_retriever(
-                        search_kwargs={
-                            "k": 5,
-                            "filter": {"company_id_slug": tenant}
-                        }
+        # PERFORMANCE OPTIMIZATION: Get query complexity and optimal model
+        complexity = get_query_complexity(qtext)
+        optimal_llm = get_optimal_llm(complexity)
+        expanded_query = expand_query_with_synonyms(qtext)
+        
+        logger.info(f"Processing query for {tenant}: {qtext[:50]}... (complexity: {complexity}, model: {optimal_llm.model_name}, has_docs: {has_company_docs})")
+        
+        company_answer = None
+        
+        if has_company_docs:
+            # Try company-specific documents first
+            try:
+                retriever = vectorstore.as_retriever(
+                    search_kwargs={
+                        "k": 5,
+                        "filter": {"company_id_slug": tenant}
+                    }
+                )
+                
+                # Test retrieval
+                test_docs = retriever.get_relevant_documents(expanded_query)
+                logger.info(f"Found {len(test_docs)} relevant company documents")
+                
+                if test_docs:
+                    # Get session memory
+                    memory = get_session_memory(session_id)
+                    
+                    # Create conversational chain
+                    qa = ConversationalRetrievalChain.from_llm(
+                        optimal_llm,
+                        retriever=retriever,
+                        memory=memory,
+                        return_source_documents=True
                     )
                     
-                    # Test retrieval
-                    test_docs = retriever.get_relevant_documents(expanded_query)
-                    logger.info(f"Found {len(test_docs)} relevant company documents")
+                    # Query the chain
+                    result = qa.invoke({"question": expanded_query})
+                    answer = clean_text(result.get("answer", ""))
+                    source_docs = result.get("source_documents", [])
                     
-                    if test_docs:
-                        # Get session memory
-                        memory = get_session_memory(session_id)
-                        
-                        # Create conversational chain
-                        qa = ConversationalRetrievalChain.from_llm(
-                            optimal_llm,
-                            retriever=retriever,
-                            memory=memory,
-                            return_source_documents=True
-                        )
-                        
-                        # Query the chain
-                        result = qa.invoke({"question": expanded_query})
-                        answer = clean_text(result.get("answer", ""))
-                        source_docs = result.get("source_documents", [])
-                        
-                        logger.info(f"Company RAG answer length: {len(answer)} chars, source docs: {len(source_docs)}")
+                    logger.info(f"Company RAG answer length: {len(answer)} chars, source docs: {len(source_docs)}")
 
-                        # Check if answer is helpful
-                        if answer and not is_unhelpful_answer(answer) and len(answer.strip()) > 10:
-                            # Smart truncation for long answers
-                            if len(answer.split()) > 150:
-                                answer = smart_truncate(answer, 150)
-                                
-                            company_answer = {
-                                "answer": answer,
-                                "fallback_used": False,
-                                "followups": generate_contextual_followups(qtext, answer),
-                                "source": "company_docs",
-                                "source_documents": len(source_docs),
-                                "session_id": session_id,
-                                "model_used": optimal_llm.model_name if hasattr(optimal_llm, 'model_name') else "unknown"
-                            }
+                    # Check if answer is helpful
+                    if answer and not is_unhelpful_answer(answer) and len(answer.strip()) > 10:
+                        # PERFORMANCE OPTIMIZATION: Smart truncation
+                        if len(answer.split()) > 150:
+                            answer = smart_truncate(answer, 150)
                             
-                            # Cache successful responses
-                            cache_response(qtext, tenant, company_answer)
-                            update_metrics(time.time() - start_time, "sop")
-                            return safe_json_response(company_answer)
-                            
-                except Exception as company_rag_error:
-                    logger.error(f"Company RAG processing error: {company_rag_error}")
-                    # Continue to general business intelligence
-            
-            # Use General Business Intelligence for all other cases
-            logger.info(f"Using general business intelligence for query: {qtext}")
-            
-            general_response = get_general_business_response(qtext, tenant)
-            general_response["session_id"] = session_id
-            
-            # Add context about company documents
-            if not has_company_docs:
-                general_response["answer"] += f"\n\nTo get answers specific to your company's procedures, consider uploading your business documents, policies, and handbooks."
-                general_response["followups"].append("How do I upload company documents?")
-            else:
-                general_response["answer"] += f"\n\nI also searched your {len(company_docs)} uploaded company documents but didn't find specific information about this topic."
-            
-            # Cache general business responses too
-            cache_response(qtext, tenant, general_response)
-            update_metrics(time.time() - start_time, "general_business")
-            performance_metrics["response_sources"]["general_business"] += 1
-            return safe_json_response(general_response)
+                        company_answer = {
+                            "answer": answer,
+                            "fallback_used": False,
+                            "followups": generate_contextual_followups(qtext, answer),
+                            "source": "company_docs",
+                            "source_documents": len(source_docs),
+                            "session_id": session_id,
+                            "model_used": optimal_llm.model_name,
+                            "complexity": complexity,
+                            "response_time": round(time.time() - start_time, 2)
+                        }
+                        
+                        # Cache successful responses
+                        cache_response(qtext, tenant, company_answer)
+                        update_metrics(time.time() - start_time, "sop")
+                        return safe_json_response(company_answer)
+                        
+            except Exception as company_rag_error:
+                logger.error(f"Company RAG processing error: {company_rag_error}")
+                # Continue to intelligent fallback
+        
+        # ENHANCED: Use LLM-based fallback for ALL companies
+        logger.info(f"Using intelligent fallback system for query: {qtext}")
+        
+        # Analyze query intent and generate fallback
+        company_name = tenant.replace('-', ' ').replace('_', ' ').title()
+        query_category = analyze_query_intent_with_llm(qtext, company_name)
+        fallback_answer = generate_fallback_response(qtext, company_name, query_category)
+        
+        # If fallback is good, use it
+        if fallback_answer and len(fallback_answer) > 50:
+            if len(fallback_answer.split()) > 150:
+                fallback_answer = smart_truncate(fallback_answer, 150)
                 
-        except Exception as rag_error:
-            logger.error(f"RAG processing error: {rag_error}")
-            # Fall back to general business intelligence
+            fallback_response = {
+                "answer": fallback_answer,
+                "followups": generate_contextual_followups(qtext, fallback_answer),
+                "source": "intelligent_fallback",
+                "category": query_category,
+                "session_id": session_id,
+                "model_used": "gpt-3.5-turbo",
+                "complexity": complexity,
+                "response_time": round(time.time() - start_time, 2)
+            }
             
-            general_response = get_general_business_response(qtext, tenant)
-            general_response["session_id"] = session_id
-            general_response["answer"] += "\n\n(Note: I encountered a technical issue searching your documents, so I provided general business guidance instead.)"
-            
+            # Cache fallback responses too
+            cache_response(qtext, tenant, fallback_response)
             update_metrics(time.time() - start_time, "general_business")
             performance_metrics["response_sources"]["general_business"] += 1
-            return safe_json_response(general_response)
+            return safe_json_response(fallback_response)
+        
+        # Final fallback: General business intelligence
+        general_response = get_general_business_response(qtext, tenant)
+        general_response["session_id"] = session_id
+        general_response["response_time"] = round(time.time() - start_time, 2)
+        
+        # Add context about company documents
+        if not has_company_docs:
+            general_response["answer"] += f"\n\nTo get answers specific to your company's procedures, consider uploading your business documents, policies, and handbooks."
+            general_response["followups"].append("How do I upload company documents?")
+        else:
+            general_response["answer"] += f"\n\nI also searched your {len(company_docs)} uploaded company documents but didn't find specific information about this topic."
+        
+        # Cache general business responses too
+        cache_response(qtext, tenant, general_response)
+        update_metrics(time.time() - start_time, "general_business")
+        performance_metrics["response_sources"]["general_business"] += 1
+        return safe_json_response(general_response)
 
     except Exception as e:
         logger.error(f"Query error: {traceback.format_exc()}")
@@ -1141,6 +1332,7 @@ def query_sop():
             "source": "error",
             "followups": ["Ask a different question", "Try a simpler query", "Check if your documents are uploaded"],
             "session_id": session_id,
+            "response_time": round(time.time() - start_time, 2),
             "error_details": str(e) if app.debug else None
         }, 500)
 
@@ -1400,13 +1592,16 @@ def clear_sessions():
 @app.route("/debug/status")
 def debug_status():
     """Debug endpoint for checking system status"""
+    cache_hit_rate = (performance_metrics['cache_hits'] / max(1, performance_metrics['total_queries'])) * 100
+    
     return safe_json_response({
         "data_path": DATA_PATH,
         "persistent_storage": os.path.exists("/data"),
         "vectorstore_loaded": vectorstore is not None,
         "total_files": len(glob.glob(os.path.join(SOP_FOLDER, "*.*"))),
-        "demo_files": len([f for f in os.listdir(SOP_FOLDER) if f.startswith("demo-business-123_")]),
+        "demo_files": len([f for f in os.listdir(SOP_FOLDER) if f.startswith("demo-business-123_")]) if os.path.exists(SOP_FOLDER) else 0,
         "cache_size": len(query_cache),
+        "cache_hit_rate": f"{cache_hit_rate:.1f}%",
         "active_sessions": len(conversation_sessions),
         "metrics": performance_metrics
     })
@@ -1441,7 +1636,7 @@ def payload_too_large(error):
 # ---- Startup Functions ----
 def startup_initialization():
     """Initialize system on startup - NO DATA WIPING"""
-    logger.info("=== OpsVoice API Startup ===")
+    logger.info("=== OpsVoice API Startup (Performance Optimized) ===")
     logger.info(f"Data path: {DATA_PATH}")
     logger.info(f"Persistent storage: {os.path.exists('/data')}")
     
@@ -1462,6 +1657,12 @@ def startup_initialization():
         logger.info(f"Found {len(demo_files)} existing demo files")
     
     logger.info("=== Startup Complete ===")
+    logger.info("Performance features enabled:")
+    logger.info("- Smart model selection (GPT-3.5 for simple, GPT-4 for complex)")
+    logger.info("- Intelligent caching with LRU eviction")
+    logger.info("- Persistent vectorstore connection")
+    logger.info("- Smart response truncation")
+    logger.info("- LLM-based fallback for all companies")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
@@ -1469,7 +1670,7 @@ if __name__ == "__main__":
     # Initialize system without wiping data
     startup_initialization()
     
-    logger.info(f"Starting Enhanced OpsVoice API v2.0.0 on port {port}")
-    logger.info("Features: Data Persistence, General Business Intelligence, Session Memory, Enhanced Security")
+    logger.info(f"Starting Performance-Optimized OpsVoice API v3.0.0 on port {port}")
+    logger.info("Target response time: <8 seconds")
     logger.info("🎯 Ready for demo and production use - works with or without uploaded documents!")
     app.run(host="0.0.0.0", port=port, debug=False)
