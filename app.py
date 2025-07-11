@@ -16,6 +16,8 @@ import secrets
 from datetime import datetime, timedelta
 import traceback
 import logging
+import chromadb
+from chromadb.config import Settings
 
 load_dotenv()
 
@@ -35,12 +37,12 @@ rate_limits = {}
 MAX_REQUESTS_PER_MINUTE = 50
 MAX_REQUESTS_PER_MINUTE_DEMO = 999  # Unlimited for demo
 MAX_CACHE_SIZE = 500
-ALLOWED_EXTENSIONS = {'pdf', 'docx'}
+ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt'}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # ---- Paths & Setup ----
 SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
-CHROMA_DIR = "/data/chroma_db"
+CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
 AUDIO_CACHE_DIR = os.path.join(DATA_PATH, "audio_cache")
 STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
 
@@ -80,7 +82,7 @@ class LRUCache(OrderedDict):
 
 query_cache = LRUCache(MAX_CACHE_SIZE)
 
-# Initialize embeddings and persistent vectorstore
+# FIXED: Initialize embeddings and persistent vectorstore
 embedding = OpenAIEmbeddings()
 vectorstore = None
 vectorstore_last_health_check = 0
@@ -152,7 +154,7 @@ def validate_file_upload(file):
     
     ext = filename.rsplit('.', 1)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return False, f"Only PDF and DOCX files allowed"
+        return False, f"Only PDF, DOCX, and TXT files allowed"
     
     # Check file size
     file.seek(0, 2)
@@ -648,184 +650,9 @@ def expand_query_with_synonyms(query):
     
     return expanded
 
-# ---- Enhanced Demo Document Creation ----
-def create_comprehensive_demo_document():
-    """Create comprehensive demo document for demo-business-123"""
-    demo_file = os.path.join(SOP_FOLDER, f"demo-business-123_{int(time.time())}_comprehensive_handbook.txt")
-    
-    demo_content = """DEMO COMPANY COMPREHENSIVE BUSINESS HANDBOOK
-
-CUSTOMER SERVICE EXCELLENCE PROCEDURES:
-
-When dealing with customers, our standard approach includes:
-1. Greet customers warmly with genuine enthusiasm
-2. Listen actively to understand their specific needs and concerns
-3. If a customer is upset, angry, or frustrated, remain calm and empathetic
-4. Ask clarifying questions to fully understand the situation
-5. Offer multiple practical solutions and alternatives when possible
-6. Follow up to ensure complete customer satisfaction
-7. Escalate to management when issues exceed your authority
-8. Document all interactions for continuous improvement
-
-For difficult customer situations:
-- Never take complaints personally
-- Use phrases like "I understand your frustration" and "Let me help you solve this"
-- Offer genuine apologies when appropriate
-- Focus on solutions, not problems
-- Know when to involve a supervisor
-
-REFUND AND RETURN POLICY:
-
-Our customer-friendly return policy includes:
-- Full refunds available within 30 days with original receipt
-- Manager approval required for refunds over $100
-- Cash refunds provided for cash purchases only
-- Credit card refunds processed to original payment method
-- Store credit offered for returns after 30 days
-- Exchanges allowed within 14 days for different sizes/colors
-- Items must be in original condition with tags attached
-- Defective products can be returned at any time with receipt
-
-Special circumstances:
-- Holiday purchases can be returned until January 31st
-- Gift receipts extend return period to 60 days
-- Damaged items receive immediate replacement or refund
-
-EMPLOYEE ONBOARDING AND TRAINING:
-
-First Week Schedule:
-Day 1: Welcome, workspace tour, paperwork completion, handbook review
-Day 2: Job-specific training begins, computer/system access setup
-Day 3: Shadow experienced team member, begin hands-on learning
-Day 4: Continue job training, first supervised customer interactions
-Day 5: Week review, feedback session, goal setting for week 2
-
-Onboarding Checklist:
-✓ Complete all HR paperwork and tax forms
-✓ Receive employee handbook and company policies
-✓ Set up email account and system access
-✓ Introduction to all team members and key personnel
-✓ Assign buddy/mentor for first month
-✓ Schedule initial training sessions based on role
-✓ Provide workspace essentials and equipment
-✓ Review emergency procedures and safety protocols
-
-SAFETY AND EMERGENCY PROCEDURES:
-
-Emergency Response Protocol:
-- Call 911 immediately for medical emergencies, fires, or security threats
-- Notify management as soon as it's safe to do so
-- All emergency exits are clearly marked throughout the building
-- Assembly point for evacuations is the parking lot across the street
-- Fire drills conducted monthly on rotating schedules
-- First aid kits located near each entrance and in break room
-- Automated External Defibrillator (AED) located at front desk
-
-Workplace Safety Guidelines:
-- Report all accidents, injuries, and near-misses immediately
-- Keep walkways and exits clear of obstructions
-- Proper lifting techniques: bend knees, not back
-- Report spills immediately and clean up promptly
-- Wear appropriate footwear (no open-toed shoes)
-- Follow lockout/tagout procedures for equipment maintenance
-
-FINANCIAL PROCEDURES AND CASH HANDLING:
-
-Daily Cash Management:
-- Count cash drawer at beginning and end of each shift
-- All transactions must be properly documented in POS system
-- Manager override required for discounts over 20%
-- Daily bank deposits made before 3 PM
-- Cash drops to safe when drawer exceeds $200
-- Never leave cash drawer unattended or open
-- Two-person verification for large cash transactions
-
-Expense and Purchasing:
-- Expense reports due by 5th of following month
-- Manager approval required for purchases over $50
-- Petty cash fund maintained at $200 maximum
-- All receipts must be submitted within 30 days
-- Corporate credit card usage requires pre-approval
-- Purchase orders needed for vendor payments over $500
-
-COMMUNICATION AND TEAMWORK:
-
-Internal Communication Standards:
-- Check email and company messaging system at start of each shift
-- Weekly team meetings every Monday at 9 AM
-- Monthly all-hands meetings first Friday of each month
-- Use professional language in all written communications
-- Respond to internal messages within 4 hours during business hours
-- Escalate urgent matters immediately to management
-
-Customer Communication:
-- Answer phones within 3 rings with standard greeting
-- Return customer calls within 24 hours
-- Email responses within 4 hours during business hours
-- Use customers' names when possible during interactions
-- Always end conversations by asking "Is there anything else I can help you with?"
-
-TECHNOLOGY AND EQUIPMENT USAGE:
-
-Computer and System Guidelines:
-- Password changes required every 90 days
-- Log out of all systems when leaving workstation
-- No personal use of company computers during work hours
-- Software installation requires IT approval
-- Regular data backups performed automatically
-- Report technical issues to IT helpdesk immediately
-
-Mobile Device and Social Media:
-- Personal phone use limited to breaks and emergencies
-- Company information cannot be shared on social media
-- Professional online presence expected for customer-facing roles
-- No photography of customers or sensitive areas without permission
-
-PERFORMANCE STANDARDS AND DEVELOPMENT:
-
-Quality Expectations:
-- Maintain professional appearance and demeanor at all times
-- Arrive on time and ready to work
-- Meet or exceed individual and team performance goals
-- Participate actively in training and development opportunities
-- Provide constructive feedback and suggestions for improvement
-- Support teammates and contribute to positive work environment
-
-Career Development:
-- Annual performance reviews with goal setting
-- Skills training opportunities available quarterly
-- Tuition reimbursement program for job-related education
-- Internal promotion preferred when positions become available
-- Cross-training encouraged to develop versatile skill sets
-- Mentoring program pairs new employees with experienced team members
-
-This handbook serves as your guide to success at Demo Company. We're committed to providing excellent customer service while maintaining a positive, productive work environment for all team members."""
-
-    with open(demo_file, 'w') as f:
-        f.write(demo_content)
-    
-    # Update status
-    metadata = {
-        "title": "Demo Company Comprehensive Business Handbook",
-        "company_id_slug": "demo-business-123",
-        "filename": os.path.basename(demo_file),
-        "uploaded_at": time.time(),
-        "status": "embedding...",
-        "is_demo": True,
-        "file_size": len(demo_content)
-    }
-    
-    update_status(os.path.basename(demo_file), metadata)
-    
-    # Start embedding
-    Thread(target=embed_sop_worker, args=(demo_file, metadata), daemon=True).start()
-    
-    logger.info(f"Created comprehensive demo document: {demo_file}")
-    return demo_file
-
-# ---- Embedding Worker ----
+# ---- FIXED: Embedding Worker with Proper Metadata ----
 def embed_sop_worker(fpath, metadata=None):
-    """Background worker for document embedding"""
+    """Background worker for document embedding with FIXED metadata handling"""
     fname = os.path.basename(fpath)
     try:
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
@@ -835,7 +662,7 @@ def embed_sop_worker(fpath, metadata=None):
             docs = UnstructuredWordDocumentLoader(fpath).load()
         elif ext == "pdf":
             docs = PyPDFLoader(fpath).load()
-        elif ext == "txt":  # Support for demo documents
+        elif ext == "txt":  # Support for text documents
             with open(fpath, 'r', encoding='utf-8') as f:
                 content = f.read()
             from langchain.schema import Document
@@ -850,43 +677,64 @@ def embed_sop_worker(fpath, metadata=None):
             separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
         ).split_documents(docs)
         
-        # Add metadata
-        for i, chunk in enumerate(chunks):
-            content_lower = chunk.page_content.lower()
-            
-            # Detect content type
-            if any(word in content_lower for word in ["angry", "upset", "difficult", "complaint"]):
-                chunk_type = "customer_service"
-            elif any(word in content_lower for word in ["cash", "money", "payment", "refund"]):
-                chunk_type = "financial"
-            elif any(word in content_lower for word in ["first day", "onboard", "training"]):
-                chunk_type = "onboarding"
-            else:
-                chunk_type = "general"
-            
-            # Extract keywords
-            words = re.findall(r'\b[a-zA-Z]{4,}\b', chunk.page_content.lower())
-            stopwords = {'that', 'this', 'with', 'they', 'have', 'will', 'from', 'been', 'were'}
-            keywords = [word for word in set(words) if word not in stopwords][:5]
-            keywords_string = " ".join(keywords)
-
-            chunk.metadata.update({
-                **(metadata or {}),
-                "chunk_id": f"{fname}_{i}",
-                "chunk_type": chunk_type,
-                "keywords": keywords_string
-            })
-       
-        # Load or create vector database
-        db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
-        db.add_documents(chunks)
-        db.persist()
+        # CRITICAL FIX: Ensure metadata is properly set for each chunk
+        company_id_slug = metadata.get("company_id_slug") if metadata else None
+        if not company_id_slug:
+            logger.error(f"No company_id_slug in metadata for {fname}")
+            raise ValueError("company_id_slug is required for embedding")
         
-        logger.info(f"Successfully embedded {len(chunks)} chunks from {fname}")
+        # Add metadata to each chunk
+        for i, chunk in enumerate(chunks):
+            # FIXED: Ensure company_id_slug is properly set in chunk metadata
+            chunk.metadata = {
+                "company_id_slug": company_id_slug,  # CRITICAL: This must match filter
+                "filename": fname,
+                "chunk_id": f"{fname}_{i}",
+                "source": fpath,
+                "uploaded_at": metadata.get("uploaded_at", time.time()),
+                "title": metadata.get("title", fname)
+            }
+            
+            # Add content-based metadata
+            content_lower = chunk.page_content.lower()
+            if any(word in content_lower for word in ["angry", "upset", "difficult", "complaint"]):
+                chunk.metadata["chunk_type"] = "customer_service"
+            elif any(word in content_lower for word in ["cash", "money", "payment", "refund"]):
+                chunk.metadata["chunk_type"] = "financial"
+            elif any(word in content_lower for word in ["first day", "onboard", "training"]):
+                chunk.metadata["chunk_type"] = "onboarding"
+            else:
+                chunk.metadata["chunk_type"] = "general"
+       
+        # FIXED: Create or load vector database with proper configuration
+        global vectorstore
+        if vectorstore is None:
+            vectorstore = Chroma(
+                persist_directory=CHROMA_DIR, 
+                embedding_function=embedding,
+                collection_name="opsvoice_docs"
+            )
+        
+        # Add documents to vectorstore
+        vectorstore.add_documents(chunks)
+        
+        # IMPORTANT: Persist the changes
+        vectorstore.persist()
+        
+        logger.info(f"Successfully embedded {len(chunks)} chunks from {fname} for company {company_id_slug}")
+        
+        # Verify embedding by testing retrieval
+        test_results = vectorstore.similarity_search(
+            "test", 
+            k=1, 
+            filter={"company_id_slug": company_id_slug}
+        )
+        logger.info(f"Verification: Found {len(test_results)} test results for {company_id_slug}")
+        
         update_status(fname, {"status": "embedded", "chunk_count": len(chunks), **(metadata or {})})
         
     except Exception as e:
-        logger.error(f"Error embedding {fname}: {e}")
+        logger.error(f"Error embedding {fname}: {traceback.format_exc()}")
         update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
 
 def update_status(filename, status):
@@ -904,7 +752,11 @@ def load_vectorstore():
     """Load the vector database with error handling"""
     global vectorstore
     try:
-        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+        vectorstore = Chroma(
+            persist_directory=CHROMA_DIR, 
+            embedding_function=embedding,
+            collection_name="opsvoice_docs"
+        )
         logger.info("Vector store loaded successfully")
         
         # Test the vectorstore
@@ -1082,15 +934,18 @@ def upload_sop():
         if not os.path.exists(save_path) or os.path.getsize(save_path) == 0:
             return safe_json_response({"error": "File save verification failed"}, 500)
         
+        # CRITICAL: Ensure metadata includes company_id_slug
         metadata = {
             "title": title,
-            "company_id_slug": tenant,
+            "company_id_slug": tenant,  # CRITICAL: This must be passed to embedding
             "filename": safe_filename,
             "uploaded_at": time.time(),
             "file_size": os.path.getsize(save_path)
         }
         
         update_status(safe_filename, {"status": "embedding...", **metadata})
+        
+        # Start embedding with proper metadata
         Thread(target=embed_sop_worker, args=(save_path, metadata), daemon=True).start()
 
         return safe_json_response({
@@ -1107,7 +962,7 @@ def upload_sop():
 
 @app.route("/query", methods=["POST", "OPTIONS"])
 def query_sop():
-    """ENHANCED query processing with performance optimizations"""
+    """ENHANCED query processing with performance optimizations and FIXED retrieval"""
     if request.method == "OPTIONS":
         return "", 204
         
@@ -1217,16 +1072,21 @@ def query_sop():
         if has_company_docs:
             # Try company-specific documents first
             try:
+                # CRITICAL FIX: Create retriever with proper filter
                 retriever = vectorstore.as_retriever(
                     search_kwargs={
                         "k": 5,
-                        "filter": {"company_id_slug": tenant}
+                        "filter": {"company_id_slug": tenant}  # This MUST match metadata
                     }
                 )
                 
-                # Test retrieval
+                # Test retrieval with expanded query
                 test_docs = retriever.get_relevant_documents(expanded_query)
-                logger.info(f"Found {len(test_docs)} relevant company documents")
+                logger.info(f"Found {len(test_docs)} relevant company documents for query")
+                
+                # Debug: Log metadata of retrieved docs
+                for i, doc in enumerate(test_docs[:2]):
+                    logger.info(f"Doc {i} metadata: {doc.metadata}")
                 
                 if test_docs:
                     # Get session memory
@@ -1237,7 +1097,8 @@ def query_sop():
                         optimal_llm,
                         retriever=retriever,
                         memory=memory,
-                        return_source_documents=True
+                        return_source_documents=True,
+                        verbose=True  # Add verbose for debugging
                     )
                     
                     # Query the chain
@@ -1272,6 +1133,7 @@ def query_sop():
                         
             except Exception as company_rag_error:
                 logger.error(f"Company RAG processing error: {company_rag_error}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 # Continue to intelligent fallback
         
         # ENHANCED: Use LLM-based fallback for ALL companies
@@ -1588,7 +1450,7 @@ def clear_sessions():
         "message": f"Cleared {session_count} conversation sessions"
     })
 
-# ---- Admin/Debug Routes (Restored) ----
+# ---- Admin/Debug Routes ----
 @app.route("/debug/status")
 def debug_status():
     """Debug endpoint for checking system status"""
@@ -1605,6 +1467,50 @@ def debug_status():
         "active_sessions": len(conversation_sessions),
         "metrics": performance_metrics
     })
+
+@app.route("/debug/vectorstore-test/<company_id>", methods=["GET"])
+def debug_vectorstore_test(company_id):
+    """Debug endpoint to test vectorstore retrieval"""
+    if not validate_company_id(company_id):
+        return safe_json_response({"error": "Invalid company ID"}, 400)
+    
+    try:
+        if not vectorstore:
+            return safe_json_response({"error": "Vectorstore not loaded"}, 500)
+        
+        # Test direct similarity search
+        test_results = vectorstore.similarity_search(
+            "test query",
+            k=5,
+            filter={"company_id_slug": company_id}
+        )
+        
+        # Get all chunks for this company
+        all_results = vectorstore.similarity_search(
+            "",  # Empty query to get all
+            k=100,
+            filter={"company_id_slug": company_id}
+        )
+        
+        return safe_json_response({
+            "company_id": company_id,
+            "test_results_count": len(test_results),
+            "total_chunks_found": len(all_results),
+            "sample_chunks": [
+                {
+                    "content": doc.page_content[:200] + "...",
+                    "metadata": doc.metadata
+                }
+                for doc in test_results[:3]
+            ]
+        })
+        
+    except Exception as e:
+        logger.error(f"Vectorstore test error: {e}")
+        return safe_json_response({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }, 500)
 
 @app.route("/admin/reload-vectorstore", methods=["POST"])
 def admin_reload_vectorstore():
@@ -1648,13 +1554,14 @@ def startup_initialization():
     existing_files = glob.glob(os.path.join(SOP_FOLDER, "*.*"))
     logger.info(f"Found {len(existing_files)} existing files")
     
-    # Create demo document only if none exist for demo business
-    demo_files = [f for f in existing_files if "demo-business-123" in f]
-    if len(demo_files) == 0:
-        logger.info("No demo files found, creating comprehensive demo document...")
-        create_comprehensive_demo_document()
-    else:
-        logger.info(f"Found {len(demo_files)} existing demo files")
+    # Verify status.json
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, 'r') as f:
+                status_data = json.load(f)
+                logger.info(f"Status tracking {len(status_data)} documents")
+        except Exception as e:
+            logger.error(f"Error reading status file: {e}")
     
     logger.info("=== Startup Complete ===")
     logger.info("Performance features enabled:")
@@ -1663,6 +1570,7 @@ def startup_initialization():
     logger.info("- Persistent vectorstore connection")
     logger.info("- Smart response truncation")
     logger.info("- LLM-based fallback for all companies")
+    logger.info("- Fixed embedding with proper company_id_slug metadata")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
@@ -1672,5 +1580,5 @@ if __name__ == "__main__":
     
     logger.info(f"Starting Performance-Optimized OpsVoice API v3.0.0 on port {port}")
     logger.info("Target response time: <8 seconds")
-    logger.info("🎯 Ready for demo and production use - works with or without uploaded documents!")
+    logger.info("🎯 Ready for production use - works with ANY uploaded documents!")
     app.run(host="0.0.0.0", port=port, debug=False)
