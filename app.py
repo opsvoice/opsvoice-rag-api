@@ -40,7 +40,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # ---- Paths & Setup ----
 SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
-CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
+CHROMA_DIR = "/data/chroma_db"
 AUDIO_CACHE_DIR = os.path.join(DATA_PATH, "audio_cache")
 STATUS_FILE = os.path.join(SOP_FOLDER, "status.json")
 
