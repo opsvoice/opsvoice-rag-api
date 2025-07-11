@@ -111,6 +111,22 @@ CORS(app, resources={
     }
 })
 
+# ... all your Flask setup, routes, etc.
+
+@app.route("/admin/clear-chroma", methods=["POST"])
+def admin_clear_chroma():
+    """Admin endpoint to wipe ChromaDB vectorstore (TEMPORARY USE)"""
+    import shutil
+    try:
+        chroma_path = CHROMA_DIR  # Uses your persistent path logic!
+        if os.path.exists(chroma_path):
+            shutil.rmtree(chroma_path)
+        os.makedirs(chroma_path, exist_ok=True)
+        return jsonify({"status": "cleared"})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 @app.after_request
 def after_request(response):
     """Enhanced CORS headers with security"""
