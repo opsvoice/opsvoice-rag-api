@@ -3,7 +3,6 @@ import os, glob, json, re, time, io, shutil, requests, hashlib
 from dotenv import load_dotenv
 from threading import Thread
 from functools import lru_cache
-from collections import OrderedDict
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -16,12 +15,6 @@ import secrets
 from datetime import datetime, timedelta
 import traceback
 import logging
-import chromadb
-from chromadb.config import Settings
-
-# Determine correct search filter key for the installed chromadb version
-# ChromaDB <1.0 expects 'filter' while newer versions switched to 'where'.
-CHROMADB_FILTER_KEY = "filter"
 
 load_dotenv()
 
@@ -41,7 +34,7 @@ rate_limits = {}
 MAX_REQUESTS_PER_MINUTE = 50
 MAX_REQUESTS_PER_MINUTE_DEMO = 999  # Unlimited for demo
 MAX_CACHE_SIZE = 500
-ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt'}
+ALLOWED_EXTENSIONS = {'pdf', 'docx'}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # ---- Paths & Setup ----
@@ -55,6 +48,9 @@ os.makedirs(SOP_FOLDER, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
+# ❌ REMOVED: The data-wiping startup code that was causing data loss!
+# NO MORE: shutil.rmtree(CHROMA_DIR) on startup
+
 # Performance tracking
 performance_metrics = {
     "total_queries": 0,
@@ -64,32 +60,12 @@ performance_metrics = {
     "response_sources": {"sop": 0, "fallback": 0, "cache": 0, "error": 0, "general_business": 0}
 }
 
-# Enhanced caching with LRU
-class LRUCache(OrderedDict):
-    def __init__(self, maxsize=500):
-        self.maxsize = maxsize
-        super().__init__()
-    
-    def __setitem__(self, key, value):
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        if len(self) > self.maxsize:
-            oldest = next(iter(self))
-            del self[oldest]
-    
-    def get(self, key, default=None):
-        if key in self:
-            self.move_to_end(key)
-            return self[key]
-        return default
+# Enhanced caching
+query_cache = {}
 
-query_cache = LRUCache(MAX_CACHE_SIZE)
-
-# FIXED: Initialize embeddings and persistent vectorstore
+# Initialize embeddings and vectorstore
 embedding = OpenAIEmbeddings()
 vectorstore = None
-vectorstore_last_health_check = 0
 
 # ---- Flask Setup ----
 app = Flask(__name__)
@@ -114,22 +90,6 @@ CORS(app, resources={
         "max_age": 3600
     }
 })
-
-# ... all your Flask setup, routes, etc.
-
-@app.route("/admin/clear-chroma", methods=["POST"])
-def admin_clear_chroma():
-    """Admin endpoint to wipe ChromaDB vectorstore (TEMPORARY USE)"""
-    import shutil
-    try:
-        chroma_path = CHROMA_DIR  # Uses your persistent path logic!
-        if os.path.exists(chroma_path):
-            shutil.rmtree(chroma_path)
-        os.makedirs(chroma_path, exist_ok=True)
-        return jsonify({"status": "cleared"})
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
 
 @app.after_request
 def after_request(response):
@@ -174,7 +134,7 @@ def validate_file_upload(file):
     
     ext = filename.rsplit('.', 1)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return False, f"Only PDF, DOCX, and TXT files allowed"
+        return False, f"Only PDF and DOCX files allowed"
     
     # Check file size
     file.seek(0, 2)
@@ -321,26 +281,20 @@ def get_session_memory(session_id):
 def get_query_complexity(query: str) -> str:
     """Determine query complexity for model selection"""
     words = query.lower().split()
-    word_count = len(words)
     
-    # Simple queries: short, basic questions
     simple_indicators = [
-        word_count <= 8,
-        any(word in query.lower() for word in ['what', 'when', 'where', 'who', 'how many', 'is there']),
-        query.endswith('?') and word_count <= 6,
-        bool(re.match(r'^(what|where|when|who|how much|how many|is there|do we have)', query.lower()))
+        len(words) <= 8,
+        any(word in query.lower() for word in ['what', 'when', 'where', 'who', 'how many']),
+        query.endswith('?') and len(words) <= 6
     ]
     
-    # Complex queries: multi-part, analytical, or detailed
     complex_indicators = [
-        word_count > 15,
-        any(word in query.lower() for word in ['analyze', 'compare', 'explain why', 'walk me through', 'detailed', 'comprehensive']),
-        query.count('?') > 1,
-        query.count(',') > 2,
-        any(word in query.lower() for word in ['and also', 'in addition', 'furthermore', 'moreover'])
+        len(words) > 15,
+        any(word in query.lower() for word in ['analyze', 'compare', 'explain why', 'walk me through']),
+        query.count('?') > 1
     ]
     
-    if sum(complex_indicators) >= 2:
+    if sum(complex_indicators) > 0:
         return "complex"
     elif sum(simple_indicators) >= 2:
         return "simple"
@@ -353,10 +307,10 @@ def get_optimal_llm(complexity: str) -> ChatOpenAI:
     
     if complexity == "simple":
         performance_metrics["model_usage"]["gpt-3.5-turbo"] += 1
-        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo", request_timeout=30)
+        return ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
     else:
         performance_metrics["model_usage"]["gpt-4"] += 1
-        return ChatOpenAI(temperature=0, model="gpt-4", request_timeout=45)
+        return ChatOpenAI(temperature=0, model="gpt-4")
 
 def get_cache_key(query: str, company_id: str) -> str:
     """Generate secure cache key"""
@@ -376,12 +330,18 @@ def get_cached_response(query: str, company_id: str) -> dict:
     return None
 
 def cache_response(query: str, company_id: str, response: dict):
-    """Cache response with LRU eviction"""
+    """Cache response with size management"""
     cache_key = get_cache_key(query, company_id)
     query_cache[cache_key] = {
         'response': response,
         'timestamp': time.time()
     }
+    
+    # Manage cache size
+    if len(query_cache) > MAX_CACHE_SIZE:
+        oldest_keys = sorted(query_cache.keys(), key=lambda k: query_cache[k]['timestamp'])[:100]
+        for key in oldest_keys:
+            del query_cache[key]
 
 def update_metrics(response_time: float, source: str):
     """Update performance metrics"""
@@ -411,123 +371,6 @@ def is_unhelpful_answer(text):
     
     return has_trigger or is_too_short
 
-def analyze_query_intent_with_llm(query: str, company_name: str) -> str:
-    """Use LLM to analyze query intent and categorize it"""
-    try:
-        intent_prompt = f"""
-        Analyze this business query and categorize it: "{query}"
-        
-        Categories: customer_service, financial_procedures, hr_onboarding, daily_operations, 
-        safety_emergency, sales_process, inventory_management, quality_compliance, 
-        marketing_communication, technology_it, general_business
-        
-        Respond with ONLY the category name.
-        """
-        
-        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
-        response = llm.invoke(intent_prompt)
-        
-        category = response.content.strip().lower()
-        valid_categories = ["customer_service", "financial_procedures", "hr_onboarding", 
-                          "daily_operations", "safety_emergency", "sales_process", 
-                          "inventory_management", "quality_compliance", "marketing_communication", 
-                          "technology_it", "general_business"]
-        
-        if category in valid_categories:
-            return category
-        else:
-            return "general_business"
-            
-    except Exception as e:
-        logger.error(f"Intent analysis error: {e}")
-        return "general_business"
-
-def generate_fallback_response(query: str, company_name: str, query_category: str) -> str:
-    """Generate intelligent fallback response based on query category"""
-    category_prompts = {
-        "customer_service": """
-        Provide best practices for handling customer service situations, including:
-        - De-escalation techniques
-        - Active listening strategies
-        - Problem resolution steps
-        - When to involve management
-        """,
-        "financial_procedures": """
-        Explain standard financial procedures and controls:
-        - Cash handling best practices
-        - Transaction documentation
-        - Approval hierarchies
-        - Audit trail maintenance
-        """,
-        "hr_onboarding": """
-        Outline effective employee onboarding practices:
-        - First day/week checklist
-        - Essential paperwork
-        - Training schedules
-        - Mentorship programs
-        """,
-        "daily_operations": """
-        Describe operational best practices:
-        - Opening/closing procedures
-        - Task prioritization
-        - Team communication
-        - Efficiency optimization
-        """,
-        "safety_emergency": """
-        Detail emergency response protocols:
-        - Emergency contact procedures
-        - Evacuation protocols
-        - First aid basics
-        - Incident reporting
-        """,
-        "sales_process": """
-        Explain effective sales techniques:
-        - Customer engagement
-        - Needs assessment
-        - Solution presentation
-        - Closing strategies
-        """,
-        "inventory_management": """
-        Describe inventory control best practices:
-        - Stock tracking methods
-        - Reorder points
-        - Loss prevention
-        - Organization systems
-        """,
-        "general_business": """
-        Provide general business guidance and best practices.
-        """
-    }
-    
-    try:
-        base_prompt = category_prompts.get(query_category, category_prompts["general_business"])
-        
-        fallback_prompt = f"""
-        A user from {company_name} asked: "{query}"
-        
-        Since I don't have their specific company procedures, provide general business best practices.
-        
-        {base_prompt}
-        
-        Start with: "I don't see specific procedures for {company_name}, but here's general business best practice:"
-        
-        Make it practical, actionable, and conversational. Limit to 2-3 paragraphs.
-        """
-        
-        llm = ChatOpenAI(temperature=0.3, model="gpt-3.5-turbo")
-        response = llm.invoke(fallback_prompt)
-        
-        return clean_text(response.content)
-        
-    except Exception as e:
-        logger.error(f"Fallback response error: {e}")
-        return f"""I don't see specific procedures for {company_name}, but here's general business best practice:
-
-For most business situations, focus on clear communication, documentation, and following established hierarchies. 
-Listen carefully to understand the full situation, document important details, and escalate to management when needed.
-
-Would you like me to help you find your company's specific procedures?"""
-
 # ---- ENHANCED: General Business Intelligence System ----
 def get_general_business_response(query: str, company_id: str = None) -> dict:
     """
@@ -535,15 +378,9 @@ def get_general_business_response(query: str, company_id: str = None) -> dict:
     Works even when no company documents are uploaded
     """
     try:
-        # Analyze query intent
-        company_name = company_id.replace('-', ' ').replace('_', ' ').title() if company_id else "your company"
-        query_category = analyze_query_intent_with_llm(query, company_name)
-        
         # Create a comprehensive business prompt
         business_prompt = f"""
         You are an expert business consultant and advisor. A user asked: "{query}"
-        
-        This appears to be a {query_category.replace('_', ' ')} question.
         
         Provide a helpful, professional business response that includes:
         1. Direct answer to their question with practical advice
@@ -563,7 +400,7 @@ def get_general_business_response(query: str, company_id: str = None) -> dict:
         
         # Generate contextual follow-ups for business topics
         followup_prompt = f"""
-        Based on this {query_category.replace('_', ' ')} question: "{query}"
+        Based on this business question: "{query}"
         
         Generate 3 relevant follow-up questions someone might ask related to this topic.
         Make them practical and actionable. Return as a simple list.
@@ -579,8 +416,7 @@ def get_general_business_response(query: str, company_id: str = None) -> dict:
                 "How do I implement this in my business?",
                 "What are common mistakes to avoid?"
             ],
-            "source": "general_business_intelligence",
-            "category": query_category
+            "source": "general_business_intelligence"
         }
         
     except Exception as e:
@@ -670,9 +506,184 @@ def expand_query_with_synonyms(query):
     
     return expanded
 
-# ---- FIXED: Embedding Worker with Proper Metadata ----
+# ---- Enhanced Demo Document Creation ----
+def create_comprehensive_demo_document():
+    """Create comprehensive demo document for demo-business-123"""
+    demo_file = os.path.join(SOP_FOLDER, f"demo-business-123_{int(time.time())}_comprehensive_handbook.txt")
+    
+    demo_content = """DEMO COMPANY COMPREHENSIVE BUSINESS HANDBOOK
+
+CUSTOMER SERVICE EXCELLENCE PROCEDURES:
+
+When dealing with customers, our standard approach includes:
+1. Greet customers warmly with genuine enthusiasm
+2. Listen actively to understand their specific needs and concerns
+3. If a customer is upset, angry, or frustrated, remain calm and empathetic
+4. Ask clarifying questions to fully understand the situation
+5. Offer multiple practical solutions and alternatives when possible
+6. Follow up to ensure complete customer satisfaction
+7. Escalate to management when issues exceed your authority
+8. Document all interactions for continuous improvement
+
+For difficult customer situations:
+- Never take complaints personally
+- Use phrases like "I understand your frustration" and "Let me help you solve this"
+- Offer genuine apologies when appropriate
+- Focus on solutions, not problems
+- Know when to involve a supervisor
+
+REFUND AND RETURN POLICY:
+
+Our customer-friendly return policy includes:
+- Full refunds available within 30 days with original receipt
+- Manager approval required for refunds over $100
+- Cash refunds provided for cash purchases only
+- Credit card refunds processed to original payment method
+- Store credit offered for returns after 30 days
+- Exchanges allowed within 14 days for different sizes/colors
+- Items must be in original condition with tags attached
+- Defective products can be returned at any time with receipt
+
+Special circumstances:
+- Holiday purchases can be returned until January 31st
+- Gift receipts extend return period to 60 days
+- Damaged items receive immediate replacement or refund
+
+EMPLOYEE ONBOARDING AND TRAINING:
+
+First Week Schedule:
+Day 1: Welcome, workspace tour, paperwork completion, handbook review
+Day 2: Job-specific training begins, computer/system access setup
+Day 3: Shadow experienced team member, begin hands-on learning
+Day 4: Continue job training, first supervised customer interactions
+Day 5: Week review, feedback session, goal setting for week 2
+
+Onboarding Checklist:
+✓ Complete all HR paperwork and tax forms
+✓ Receive employee handbook and company policies
+✓ Set up email account and system access
+✓ Introduction to all team members and key personnel
+✓ Assign buddy/mentor for first month
+✓ Schedule initial training sessions based on role
+✓ Provide workspace essentials and equipment
+✓ Review emergency procedures and safety protocols
+
+SAFETY AND EMERGENCY PROCEDURES:
+
+Emergency Response Protocol:
+- Call 911 immediately for medical emergencies, fires, or security threats
+- Notify management as soon as it's safe to do so
+- All emergency exits are clearly marked throughout the building
+- Assembly point for evacuations is the parking lot across the street
+- Fire drills conducted monthly on rotating schedules
+- First aid kits located near each entrance and in break room
+- Automated External Defibrillator (AED) located at front desk
+
+Workplace Safety Guidelines:
+- Report all accidents, injuries, and near-misses immediately
+- Keep walkways and exits clear of obstructions
+- Proper lifting techniques: bend knees, not back
+- Report spills immediately and clean up promptly
+- Wear appropriate footwear (no open-toed shoes)
+- Follow lockout/tagout procedures for equipment maintenance
+
+FINANCIAL PROCEDURES AND CASH HANDLING:
+
+Daily Cash Management:
+- Count cash drawer at beginning and end of each shift
+- All transactions must be properly documented in POS system
+- Manager override required for discounts over 20%
+- Daily bank deposits made before 3 PM
+- Cash drops to safe when drawer exceeds $200
+- Never leave cash drawer unattended or open
+- Two-person verification for large cash transactions
+
+Expense and Purchasing:
+- Expense reports due by 5th of following month
+- Manager approval required for purchases over $50
+- Petty cash fund maintained at $200 maximum
+- All receipts must be submitted within 30 days
+- Corporate credit card usage requires pre-approval
+- Purchase orders needed for vendor payments over $500
+
+COMMUNICATION AND TEAMWORK:
+
+Internal Communication Standards:
+- Check email and company messaging system at start of each shift
+- Weekly team meetings every Monday at 9 AM
+- Monthly all-hands meetings first Friday of each month
+- Use professional language in all written communications
+- Respond to internal messages within 4 hours during business hours
+- Escalate urgent matters immediately to management
+
+Customer Communication:
+- Answer phones within 3 rings with standard greeting
+- Return customer calls within 24 hours
+- Email responses within 4 hours during business hours
+- Use customers' names when possible during interactions
+- Always end conversations by asking "Is there anything else I can help you with?"
+
+TECHNOLOGY AND EQUIPMENT USAGE:
+
+Computer and System Guidelines:
+- Password changes required every 90 days
+- Log out of all systems when leaving workstation
+- No personal use of company computers during work hours
+- Software installation requires IT approval
+- Regular data backups performed automatically
+- Report technical issues to IT helpdesk immediately
+
+Mobile Device and Social Media:
+- Personal phone use limited to breaks and emergencies
+- Company information cannot be shared on social media
+- Professional online presence expected for customer-facing roles
+- No photography of customers or sensitive areas without permission
+
+PERFORMANCE STANDARDS AND DEVELOPMENT:
+
+Quality Expectations:
+- Maintain professional appearance and demeanor at all times
+- Arrive on time and ready to work
+- Meet or exceed individual and team performance goals
+- Participate actively in training and development opportunities
+- Provide constructive feedback and suggestions for improvement
+- Support teammates and contribute to positive work environment
+
+Career Development:
+- Annual performance reviews with goal setting
+- Skills training opportunities available quarterly
+- Tuition reimbursement program for job-related education
+- Internal promotion preferred when positions become available
+- Cross-training encouraged to develop versatile skill sets
+- Mentoring program pairs new employees with experienced team members
+
+This handbook serves as your guide to success at Demo Company. We're committed to providing excellent customer service while maintaining a positive, productive work environment for all team members."""
+
+    with open(demo_file, 'w', encoding='utf-8') as f:
+        f.write(demo_content)
+    
+    # Update status
+    metadata = {
+        "title": "Demo Company Comprehensive Business Handbook",
+        "company_id_slug": "demo-business-123",
+        "filename": os.path.basename(demo_file),
+        "uploaded_at": time.time(),
+        "status": "embedding...",
+        "is_demo": True,
+        "file_size": len(demo_content)
+    }
+    
+    update_status(os.path.basename(demo_file), metadata)
+    
+    # Start embedding
+    Thread(target=embed_sop_worker, args=(demo_file, metadata), daemon=True).start()
+    
+    logger.info(f"Created comprehensive demo document: {demo_file}")
+    return demo_file
+
+# ---- Embedding Worker ----
 def embed_sop_worker(fpath, metadata=None):
-    """Background worker for document embedding with FIXED metadata handling"""
+    """Background worker for document embedding"""
     fname = os.path.basename(fpath)
     try:
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
@@ -682,7 +693,7 @@ def embed_sop_worker(fpath, metadata=None):
             docs = UnstructuredWordDocumentLoader(fpath).load()
         elif ext == "pdf":
             docs = PyPDFLoader(fpath).load()
-        elif ext == "txt":  # Support for text documents
+        elif ext == "txt":  # Support for demo documents
             with open(fpath, 'r', encoding='utf-8') as f:
                 content = f.read()
             from langchain.schema import Document
@@ -697,64 +708,43 @@ def embed_sop_worker(fpath, metadata=None):
             separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
         ).split_documents(docs)
         
-        # CRITICAL FIX: Ensure metadata is properly set for each chunk
-        company_id_slug = metadata.get("company_id_slug") if metadata else None
-        if not company_id_slug:
-            logger.error(f"No company_id_slug in metadata for {fname}")
-            raise ValueError("company_id_slug is required for embedding")
-        
-        # Add metadata to each chunk
+        # Add metadata
         for i, chunk in enumerate(chunks):
-            # FIXED: Ensure company_id_slug is properly set in chunk metadata
-            chunk.metadata = {
-                "company_id_slug": company_id_slug,  # CRITICAL: This must match filter
-                "filename": fname,
-                "chunk_id": f"{fname}_{i}",
-                "source": fpath,
-                "uploaded_at": metadata.get("uploaded_at", time.time()),
-                "title": metadata.get("title", fname)
-            }
-            
-            # Add content-based metadata
             content_lower = chunk.page_content.lower()
+            
+            # Detect content type
             if any(word in content_lower for word in ["angry", "upset", "difficult", "complaint"]):
-                chunk.metadata["chunk_type"] = "customer_service"
+                chunk_type = "customer_service"
             elif any(word in content_lower for word in ["cash", "money", "payment", "refund"]):
-                chunk.metadata["chunk_type"] = "financial"
+                chunk_type = "financial"
             elif any(word in content_lower for word in ["first day", "onboard", "training"]):
-                chunk.metadata["chunk_type"] = "onboarding"
+                chunk_type = "onboarding"
             else:
-                chunk.metadata["chunk_type"] = "general"
+                chunk_type = "general"
+            
+            # Extract keywords
+            words = re.findall(r'\b[a-zA-Z]{4,}\b', chunk.page_content.lower())
+            stopwords = {'that', 'this', 'with', 'they', 'have', 'will', 'from', 'been', 'were'}
+            keywords = [word for word in set(words) if word not in stopwords][:5]
+            keywords_string = " ".join(keywords)
+
+            chunk.metadata.update({
+                **(metadata or {}),
+                "chunk_id": f"{fname}_{i}",
+                "chunk_type": chunk_type,
+                "keywords": keywords_string
+            })
        
-        # FIXED: Create or load vector database with proper configuration
-        global vectorstore
-        if vectorstore is None:
-            vectorstore = Chroma(
-                persist_directory=CHROMA_DIR, 
-                embedding_function=embedding,
-                collection_name="opsvoice_docs"
-            )
+        # Load or create vector database
+        db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+        db.add_documents(chunks)
+        db.persist()
         
-        # Add documents to vectorstore
-        vectorstore.add_documents(chunks)
-        
-        # IMPORTANT: Persist the changes
-        vectorstore.persist()
-        
-        logger.info(f"Successfully embedded {len(chunks)} chunks from {fname} for company {company_id_slug}")
-        
-        # Verify embedding by testing retrieval
-        test_results = vectorstore.similarity_search(
-            "test", 
-            k=1, 
-            filter={"company_id_slug": company_id_slug}
-        )
-        logger.info(f"Verification: Found {len(test_results)} test results for {company_id_slug}")
-        
+        logger.info(f"Successfully embedded {len(chunks)} chunks from {fname}")
         update_status(fname, {"status": "embedded", "chunk_count": len(chunks), **(metadata or {})})
         
     except Exception as e:
-        logger.error(f"Error embedding {fname}: {traceback.format_exc()}")
+        logger.error(f"Error embedding {fname}: {e}")
         update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
 
 def update_status(filename, status):
@@ -772,11 +762,7 @@ def load_vectorstore():
     """Load the vector database with error handling"""
     global vectorstore
     try:
-        vectorstore = Chroma(
-            persist_directory=CHROMA_DIR, 
-            embedding_function=embedding,
-            collection_name="opsvoice_docs"
-        )
+        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
         logger.info("Vector store loaded successfully")
         
         # Test the vectorstore
@@ -788,29 +774,16 @@ def load_vectorstore():
         vectorstore = None
 
 def ensure_vectorstore():
-    """Ensure vectorstore is available with health checks"""
-    global vectorstore, vectorstore_last_health_check
-    
-    # Health check every 5 minutes
-    current_time = time.time()
-    if current_time - vectorstore_last_health_check > 300:  # 5 minutes
-        try:
-            if vectorstore:
-                # Test the connection
-                test_results = vectorstore.similarity_search("health_check", k=1)
-                vectorstore_last_health_check = current_time
-                return True
-            else:
-                load_vectorstore()
-                vectorstore_last_health_check = current_time
-                return vectorstore is not None
-        except Exception as e:
-            logger.error(f"Vectorstore health check failed: {e}")
+    """Ensure vectorstore is available"""
+    global vectorstore
+    try:
+        if not vectorstore:
             load_vectorstore()
-            vectorstore_last_health_check = current_time
-            return vectorstore is not None
-    
-    return vectorstore is not None
+        return vectorstore is not None
+    except Exception as e:
+        logger.error(f"Vectorstore health check failed: {e}")
+        load_vectorstore()
+        return vectorstore is not None
 
 def get_company_documents_internal(company_id_slug):
     """Get documents for a company"""
@@ -850,23 +823,10 @@ def home():
     return safe_json_response({
         "status": "ok", 
         "message": "🚀 OpsVoice RAG API is live!",
-        "version": "3.0.0-performance-optimized",
-        "features": [
-            "smart_model_selection",
-            "intelligent_caching", 
-            "persistent_vectorstore",
-            "smart_truncation",
-            "llm_based_fallback",
-            "general_business_intelligence",
-            "session_memory",
-            "performance_tracking"
-        ],
+        "version": "2.0.0-production-enhanced",
+        "features": ["data_persistence", "general_business_intelligence", "session_memory", "smart_truncation", "security_enhanced", "demo_ready"],
         "data_path": DATA_PATH,
-        "persistent_storage": os.path.exists("/data"),
-        "performance": {
-            "cache_hit_rate": f"{(performance_metrics['cache_hits'] / max(1, performance_metrics['total_queries']) * 100):.1f}%",
-            "avg_response_time": f"{performance_metrics['avg_response_time']:.2f}s"
-        }
+        "persistent_storage": os.path.exists("/data")
     })
 
 @app.route("/healthz")
@@ -954,18 +914,15 @@ def upload_sop():
         if not os.path.exists(save_path) or os.path.getsize(save_path) == 0:
             return safe_json_response({"error": "File save verification failed"}, 500)
         
-        # CRITICAL: Ensure metadata includes company_id_slug
         metadata = {
             "title": title,
-            "company_id_slug": tenant,  # CRITICAL: This must be passed to embedding
+            "company_id_slug": tenant,
             "filename": safe_filename,
             "uploaded_at": time.time(),
             "file_size": os.path.getsize(save_path)
         }
         
         update_status(safe_filename, {"status": "embedding...", **metadata})
-        
-        # Start embedding with proper metadata
         Thread(target=embed_sop_worker, args=(save_path, metadata), daemon=True).start()
 
         return safe_json_response({
@@ -982,7 +939,7 @@ def upload_sop():
 
 @app.route("/query", methods=["POST", "OPTIONS"])
 def query_sop():
-    """ENHANCED query processing with performance optimizations and FIXED retrieval"""
+    """ENHANCED query processing with general business intelligence and company document search"""
     if request.method == "OPTIONS":
         return "", 204
         
@@ -1031,12 +988,10 @@ def query_sop():
                 "session_id": session_id
             }, 429)
 
-        # PERFORMANCE OPTIMIZATION: Check cache first
+        # Check cache first
         cached_response = get_cached_response(qtext, tenant)
         if cached_response:
             cached_response["session_id"] = session_id
-            cached_response["cache_hit"] = True
-            cached_response["response_time"] = round(time.time() - start_time, 2)
             update_metrics(time.time() - start_time, "cache")
             return safe_json_response(cached_response)
 
@@ -1046,7 +1001,6 @@ def query_sop():
             logger.warning("Vectorstore unavailable, using general business intelligence")
             general_response = get_general_business_response(qtext, tenant)
             general_response["session_id"] = session_id
-            general_response["response_time"] = round(time.time() - start_time, 2)
             performance_metrics["response_sources"]["general_business"] += 1
             update_metrics(time.time() - start_time, "general_business")
             return safe_json_response(general_response)
@@ -1057,8 +1011,7 @@ def query_sop():
                 "answer": "Could you please be more specific? What procedure or policy are you looking for?",
                 "source": "clarify",
                 "followups": ["How do I handle customer complaints?", "What's the refund procedure?", "Where are the training documents?"],
-                "session_id": session_id,
-                "response_time": round(time.time() - start_time, 2)
+                "session_id": session_id
             }
             update_metrics(time.time() - start_time, "clarify")
             return safe_json_response(response)
@@ -1070,8 +1023,7 @@ def query_sop():
                 "answer": "Please ask questions about your company procedures and policies.",
                 "source": "off_topic",
                 "followups": ["What are our customer service procedures?", "How do I process a refund?", "What's the onboarding process?"],
-                "session_id": session_id,
-                "response_time": round(time.time() - start_time, 2)
+                "session_id": session_id
             }
             update_metrics(time.time() - start_time, "off_topic")
             return safe_json_response(response)
@@ -1080,129 +1032,104 @@ def query_sop():
         company_docs = get_company_documents_internal(tenant)
         has_company_docs = len(company_docs) > 0
 
-        # PERFORMANCE OPTIMIZATION: Get query complexity and optimal model
-        complexity = get_query_complexity(qtext)
-        optimal_llm = get_optimal_llm(complexity)
-        expanded_query = expand_query_with_synonyms(qtext)
-        
-        logger.info(f"Processing query for {tenant}: {qtext[:50]}... (complexity: {complexity}, model: {optimal_llm.model_name}, has_docs: {has_company_docs})")
-        
-        company_answer = None
-        
-        if has_company_docs:
-            # Try company-specific documents first
-            try:
-                # CRITICAL FIX: Create retriever with proper filter
-                retriever = vectorstore.as_retriever(
-                    search_kwargs={
-                        "k": 5,
-                        CHROMADB_FILTER_KEY: {"company_id_slug": tenant}  # This MUST match metadata
-                    }
-                )
-                
-                # Test retrieval with expanded query
-                test_docs = retriever.get_relevant_documents(expanded_query)
-                logger.info(f"Found {len(test_docs)} relevant company documents for query")
-                
-                # Debug: Log metadata of retrieved docs
-                for i, doc in enumerate(test_docs[:2]):
-                    logger.info(f"Doc {i} metadata: {doc.metadata}")
-                
-                if test_docs:
-                    # Get session memory
-                    memory = get_session_memory(session_id)
-                    
-                    # Create conversational chain
-                    qa = ConversationalRetrievalChain.from_llm(
-                        optimal_llm,
-                        retriever=retriever,
-                        memory=memory,
-                        return_source_documents=True,
-                        verbose=True  # Add verbose for debugging
+        # Process with RAG or General Business Intelligence
+        try:
+            complexity = get_query_complexity(qtext)
+            optimal_llm = get_optimal_llm(complexity)
+            expanded_query = expand_query_with_synonyms(qtext)
+            
+            logger.info(f"Processing query for {tenant}: {qtext[:50]}... (complexity: {complexity}, has_docs: {has_company_docs})")
+            
+            company_answer = None
+            
+            if has_company_docs:
+                # Try company-specific documents first
+                try:
+                    retriever = vectorstore.as_retriever(
+                        search_kwargs={
+                            "k": 5,
+                            "filter": {"company_id_slug": tenant}
+                        }
                     )
                     
-                    # Query the chain
-                    result = qa.invoke({"question": expanded_query})
-                    answer = clean_text(result.get("answer", ""))
-                    source_docs = result.get("source_documents", [])
+                    # Test retrieval
+                    test_docs = retriever.get_relevant_documents(expanded_query)
+                    logger.info(f"Found {len(test_docs)} relevant company documents")
                     
-                    logger.info(f"Company RAG answer length: {len(answer)} chars, source docs: {len(source_docs)}")
+                    if test_docs:
+                        # Get session memory
+                        memory = get_session_memory(session_id)
+                        
+                        # Create conversational chain
+                        qa = ConversationalRetrievalChain.from_llm(
+                            optimal_llm,
+                            retriever=retriever,
+                            memory=memory,
+                            return_source_documents=True
+                        )
+                        
+                        # Query the chain
+                        result = qa.invoke({"question": expanded_query})
+                        answer = clean_text(result.get("answer", ""))
+                        source_docs = result.get("source_documents", [])
+                        
+                        logger.info(f"Company RAG answer length: {len(answer)} chars, source docs: {len(source_docs)}")
 
-                    # Check if answer is helpful
-                    if answer and not is_unhelpful_answer(answer) and len(answer.strip()) > 10:
-                        # PERFORMANCE OPTIMIZATION: Smart truncation
-                        if len(answer.split()) > 150:
-                            answer = smart_truncate(answer, 150)
+                        # Check if answer is helpful
+                        if answer and not is_unhelpful_answer(answer) and len(answer.strip()) > 10:
+                            # Smart truncation for long answers
+                            if len(answer.split()) > 150:
+                                answer = smart_truncate(answer, 150)
+                                
+                            company_answer = {
+                                "answer": answer,
+                                "fallback_used": False,
+                                "followups": generate_contextual_followups(qtext, answer),
+                                "source": "company_docs",
+                                "source_documents": len(source_docs),
+                                "session_id": session_id,
+                                "model_used": optimal_llm.model_name if hasattr(optimal_llm, 'model_name') else "unknown"
+                            }
                             
-                        company_answer = {
-                            "answer": answer,
-                            "fallback_used": False,
-                            "followups": generate_contextual_followups(qtext, answer),
-                            "source": "company_docs",
-                            "source_documents": len(source_docs),
-                            "session_id": session_id,
-                            "model_used": optimal_llm.model_name,
-                            "complexity": complexity,
-                            "response_time": round(time.time() - start_time, 2)
-                        }
-                        
-                        # Cache successful responses
-                        cache_response(qtext, tenant, company_answer)
-                        update_metrics(time.time() - start_time, "sop")
-                        return safe_json_response(company_answer)
-                        
-            except Exception as company_rag_error:
-                logger.error(f"Company RAG processing error: {company_rag_error}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                # Continue to intelligent fallback
-        
-        # ENHANCED: Use LLM-based fallback for ALL companies
-        logger.info(f"Using intelligent fallback system for query: {qtext}")
-        
-        # Analyze query intent and generate fallback
-        company_name = tenant.replace('-', ' ').replace('_', ' ').title()
-        query_category = analyze_query_intent_with_llm(qtext, company_name)
-        fallback_answer = generate_fallback_response(qtext, company_name, query_category)
-        
-        # If fallback is good, use it
-        if fallback_answer and len(fallback_answer) > 50:
-            if len(fallback_answer.split()) > 150:
-                fallback_answer = smart_truncate(fallback_answer, 150)
-                
-            fallback_response = {
-                "answer": fallback_answer,
-                "followups": generate_contextual_followups(qtext, fallback_answer),
-                "source": "intelligent_fallback",
-                "category": query_category,
-                "session_id": session_id,
-                "model_used": "gpt-3.5-turbo",
-                "complexity": complexity,
-                "response_time": round(time.time() - start_time, 2)
-            }
+                            # Cache successful responses
+                            cache_response(qtext, tenant, company_answer)
+                            update_metrics(time.time() - start_time, "sop")
+                            return safe_json_response(company_answer)
+                            
+                except Exception as company_rag_error:
+                    logger.error(f"Company RAG processing error: {company_rag_error}")
+                    # Continue to general business intelligence
             
-            # Cache fallback responses too
-            cache_response(qtext, tenant, fallback_response)
+            # Use General Business Intelligence for all other cases
+            logger.info(f"Using general business intelligence for query: {qtext}")
+            
+            general_response = get_general_business_response(qtext, tenant)
+            general_response["session_id"] = session_id
+            
+            # Add context about company documents
+            if not has_company_docs:
+                general_response["answer"] += f"\n\nTo get answers specific to your company's procedures, consider uploading your business documents, policies, and handbooks."
+                general_response["followups"].append("How do I upload company documents?")
+            else:
+                general_response["answer"] += f"\n\nI also searched your {len(company_docs)} uploaded company documents but didn't find specific information about this topic."
+            
+            # Cache general business responses too
+            cache_response(qtext, tenant, general_response)
             update_metrics(time.time() - start_time, "general_business")
             performance_metrics["response_sources"]["general_business"] += 1
-            return safe_json_response(fallback_response)
-        
-        # Final fallback: General business intelligence
-        general_response = get_general_business_response(qtext, tenant)
-        general_response["session_id"] = session_id
-        general_response["response_time"] = round(time.time() - start_time, 2)
-        
-        # Add context about company documents
-        if not has_company_docs:
-            general_response["answer"] += f"\n\nTo get answers specific to your company's procedures, consider uploading your business documents, policies, and handbooks."
-            general_response["followups"].append("How do I upload company documents?")
-        else:
-            general_response["answer"] += f"\n\nI also searched your {len(company_docs)} uploaded company documents but didn't find specific information about this topic."
-        
-        # Cache general business responses too
-        cache_response(qtext, tenant, general_response)
-        update_metrics(time.time() - start_time, "general_business")
-        performance_metrics["response_sources"]["general_business"] += 1
-        return safe_json_response(general_response)
+            return safe_json_response(general_response)
+                
+        except Exception as rag_error:
+            logger.error(f"RAG processing error: {rag_error}")
+            # Fall back to general business intelligence
+            
+            general_response = get_general_business_response(qtext, tenant)
+            general_response["session_id"] = session_id
+            general_response["answer"] += "\n\n(Note: I encountered a technical issue searching your documents, so I provided general business guidance instead.)"
+            
+            update_metrics(time.time() - start_time, "general_business")
+            performance_metrics["response_sources"]["general_business"] += 1
+            return safe_json_response(general_response)
 
     except Exception as e:
         logger.error(f"Query error: {traceback.format_exc()}")
@@ -1214,7 +1141,6 @@ def query_sop():
             "source": "error",
             "followups": ["Ask a different question", "Try a simpler query", "Check if your documents are uploaded"],
             "session_id": session_id,
-            "response_time": round(time.time() - start_time, 2),
             "error_details": str(e) if app.debug else None
         }, 500)
 
@@ -1470,67 +1396,20 @@ def clear_sessions():
         "message": f"Cleared {session_count} conversation sessions"
     })
 
-# ---- Admin/Debug Routes ----
+# ---- Admin/Debug Routes (Restored) ----
 @app.route("/debug/status")
 def debug_status():
     """Debug endpoint for checking system status"""
-    cache_hit_rate = (performance_metrics['cache_hits'] / max(1, performance_metrics['total_queries'])) * 100
-    
     return safe_json_response({
         "data_path": DATA_PATH,
         "persistent_storage": os.path.exists("/data"),
         "vectorstore_loaded": vectorstore is not None,
         "total_files": len(glob.glob(os.path.join(SOP_FOLDER, "*.*"))),
-        "demo_files": len([f for f in os.listdir(SOP_FOLDER) if f.startswith("demo-business-123_")]) if os.path.exists(SOP_FOLDER) else 0,
+        "demo_files": len([f for f in os.listdir(SOP_FOLDER) if f.startswith("demo-business-123_")]),
         "cache_size": len(query_cache),
-        "cache_hit_rate": f"{cache_hit_rate:.1f}%",
         "active_sessions": len(conversation_sessions),
         "metrics": performance_metrics
     })
-
-@app.route("/debug/vectorstore-test/<company_id>", methods=["GET"])
-def debug_vectorstore_test(company_id):
-    """Debug endpoint to test vectorstore retrieval"""
-    if not validate_company_id(company_id):
-        return safe_json_response({"error": "Invalid company ID"}, 400)
-    
-    try:
-        if not vectorstore:
-            return safe_json_response({"error": "Vectorstore not loaded"}, 500)
-        
-        # Test direct similarity search
-        test_results = vectorstore.similarity_search(
-            "test query",
-            k=5,
-            filter={"company_id_slug": company_id}
-        )
-        
-        # Get all chunks for this company
-        all_results = vectorstore.similarity_search(
-            "",  # Empty query to get all
-            k=100,
-            filter={"company_id_slug": company_id}
-        )
-        
-        return safe_json_response({
-            "company_id": company_id,
-            "test_results_count": len(test_results),
-            "total_chunks_found": len(all_results),
-            "sample_chunks": [
-                {
-                    "content": doc.page_content[:200] + "...",
-                    "metadata": doc.metadata
-                }
-                for doc in test_results[:3]
-            ]
-        })
-        
-    except Exception as e:
-        logger.error(f"Vectorstore test error: {e}")
-        return safe_json_response({
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }, 500)
 
 @app.route("/admin/reload-vectorstore", methods=["POST"])
 def admin_reload_vectorstore():
@@ -1544,26 +1423,6 @@ def admin_reload_vectorstore():
     except Exception as e:
         logger.error(f"Vectorstore reload error: {e}")
         return safe_json_response({"error": "Reload failed"}, 500)
-
-@app.route('/admin/clear-sop-files', methods=['POST'])
-def clear_sop_files():
-    """TEMP: Danger! Remove after use."""
-    import glob
-    import os
-    deleted = 0
-    for file in glob.glob(os.path.join(SOP_FOLDER, '*')):
-        try:
-            os.remove(file)
-            deleted += 1
-        except Exception as e:
-            continue
-    # Reset status.json
-    try:
-        with open(STATUS_FILE, "w") as f:
-            f.write("{}")
-    except Exception:
-        pass
-    return jsonify({"status": "sop_files_cleared", "files_deleted": deleted})
 
 # ---- Error Handlers ----
 @app.errorhandler(404)
@@ -1582,7 +1441,7 @@ def payload_too_large(error):
 # ---- Startup Functions ----
 def startup_initialization():
     """Initialize system on startup - NO DATA WIPING"""
-    logger.info("=== OpsVoice API Startup (Performance Optimized) ===")
+    logger.info("=== OpsVoice API Startup ===")
     logger.info(f"Data path: {DATA_PATH}")
     logger.info(f"Persistent storage: {os.path.exists('/data')}")
     
@@ -1594,23 +1453,15 @@ def startup_initialization():
     existing_files = glob.glob(os.path.join(SOP_FOLDER, "*.*"))
     logger.info(f"Found {len(existing_files)} existing files")
     
-    # Verify status.json
-    if os.path.exists(STATUS_FILE):
-        try:
-            with open(STATUS_FILE, 'r') as f:
-                status_data = json.load(f)
-                logger.info(f"Status tracking {len(status_data)} documents")
-        except Exception as e:
-            logger.error(f"Error reading status file: {e}")
+    # Create demo document only if none exist for demo business
+    demo_files = [f for f in existing_files if "demo-business-123" in f]
+    if len(demo_files) == 0:
+        logger.info("No demo files found, creating comprehensive demo document...")
+        create_comprehensive_demo_document()
+    else:
+        logger.info(f"Found {len(demo_files)} existing demo files")
     
     logger.info("=== Startup Complete ===")
-    logger.info("Performance features enabled:")
-    logger.info("- Smart model selection (GPT-3.5 for simple, GPT-4 for complex)")
-    logger.info("- Intelligent caching with LRU eviction")
-    logger.info("- Persistent vectorstore connection")
-    logger.info("- Smart response truncation")
-    logger.info("- LLM-based fallback for all companies")
-    logger.info("- Fixed embedding with proper company_id_slug metadata")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
@@ -1618,7 +1469,7 @@ if __name__ == "__main__":
     # Initialize system without wiping data
     startup_initialization()
     
-    logger.info(f"Starting Performance-Optimized OpsVoice API v3.0.0 on port {port}")
-    logger.info("Target response time: <8 seconds")
-    logger.info("🎯 Ready for production use - works with ANY uploaded documents!")
+    logger.info(f"Starting Enhanced OpsVoice API v2.0.0 on port {port}")
+    logger.info("Features: Data Persistence, General Business Intelligence, Session Memory, Enhanced Security")
+    logger.info("🎯 Ready for demo and production use - works with or without uploaded documents!")
     app.run(host="0.0.0.0", port=port, debug=False)
