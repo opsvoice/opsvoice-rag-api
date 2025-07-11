@@ -1541,6 +1541,26 @@ def admin_reload_vectorstore():
         logger.error(f"Vectorstore reload error: {e}")
         return safe_json_response({"error": "Reload failed"}, 500)
 
+@app.route('/admin/clear-sop-files', methods=['POST'])
+def clear_sop_files():
+    """TEMP: Danger! Remove after use."""
+    import glob
+    import os
+    deleted = 0
+    for file in glob.glob(os.path.join(SOP_FOLDER, '*')):
+        try:
+            os.remove(file)
+            deleted += 1
+        except Exception as e:
+            continue
+    # Reset status.json
+    try:
+        with open(STATUS_FILE, "w") as f:
+            f.write("{}")
+    except Exception:
+        pass
+    return jsonify({"status": "sop_files_cleared", "files_deleted": deleted})
+
 # ---- Error Handlers ----
 @app.errorhandler(404)
 def not_found(error):
