@@ -3,7 +3,7 @@ services:
     name: opsvoice-rag-api
     env: python
     plan: standard
-    buildCommand: pip install -r requirements.txt && python embed_sop.py   # <--- embed during build
+    buildCommand: pip install -r requirements.txt && python reembed_documents.py   # <--- embed during build
     startCommand: gunicorn -b 0.0.0.0:10000 app:app                       # <--- only start API here!
     envVars:
       - key: PORT
