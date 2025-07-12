@@ -18,16 +18,34 @@ import traceback
 import logging
 import chromadb
 from chromadb.config import Settings
-
-# Determine correct search filter key for the installed chromadb version
-# ChromaDB <1.0 expects 'filter' while newer versions switched to 'where'.
-CHROMADB_FILTER_KEY = "where"
+import pkg_resources
 
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---- CRITICAL FIX: Detect ChromaDB version and use correct filter key ----
+def get_chromadb_filter_key():
+    """Detect ChromaDB version and return correct filter key"""
+    try:
+        chromadb_version = pkg_resources.get_distribution("chromadb").version
+        version_parts = [int(x) for x in chromadb_version.split('.')]
+        
+        # ChromaDB 0.4.x and newer use "where", older versions use "filter"
+        if version_parts[0] > 0 or (version_parts[0] == 0 and version_parts[1] >= 4):
+            logger.info(f"ChromaDB version {chromadb_version} detected - using 'where' filter")
+            return "where"
+        else:
+            logger.info(f"ChromaDB version {chromadb_version} detected - using 'filter' filter")
+            return "filter"
+    except Exception as e:
+        logger.warning(f"Could not detect ChromaDB version: {e}. Trying 'where' first.")
+        return "where"
+
+# Set the correct filter key
+CHROMADB_FILTER_KEY = get_chromadb_filter_key()
 
 # ---- FIXED: Persistent Data Path (NO MORE DATA WIPING) ----
 if os.path.exists("/data"):
@@ -115,8 +133,6 @@ CORS(app, resources={
     }
 })
 
-# ... all your Flask setup, routes, etc.
-
 @app.route("/admin/clear-chroma", methods=["POST"])
 def admin_clear_chroma():
     """Admin endpoint to wipe ChromaDB vectorstore (TEMPORARY USE)"""
@@ -129,7 +145,6 @@ def admin_clear_chroma():
         return jsonify({"status": "cleared"})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
-
 
 @app.after_request
 def after_request(response):
@@ -670,11 +685,14 @@ def expand_query_with_synonyms(query):
     
     return expanded
 
-# ---- FIXED: Embedding Worker with Proper Metadata ----
+# ---- FIXED: Embedding Worker with Proper Metadata and DEBUGGING ----
 def embed_sop_worker(fpath, metadata=None):
-    """Background worker for document embedding with FIXED metadata handling"""
+    """Background worker for document embedding with FIXED metadata handling and debugging"""
     fname = os.path.basename(fpath)
     try:
+        logger.info(f"[EMBED] Starting embedding for {fname}")
+        logger.info(f"[EMBED] Metadata received: {metadata}")
+        
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
         
         # Load documents based on file type
@@ -682,13 +700,15 @@ def embed_sop_worker(fpath, metadata=None):
             docs = UnstructuredWordDocumentLoader(fpath).load()
         elif ext == "pdf":
             docs = PyPDFLoader(fpath).load()
-        elif ext == "txt":  # Support for text documents
+        elif ext == "txt":
             with open(fpath, 'r', encoding='utf-8') as f:
                 content = f.read()
             from langchain.schema import Document
             docs = [Document(page_content=content, metadata={"source": fpath})]
         else:
             raise ValueError(f"Unsupported file type: {ext}")
+        
+        logger.info(f"[EMBED] Loaded {len(docs)} documents")
         
         # Enhanced chunking
         chunks = RecursiveCharacterTextSplitter(
@@ -697,23 +717,32 @@ def embed_sop_worker(fpath, metadata=None):
             separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
         ).split_documents(docs)
         
+        logger.info(f"[EMBED] Created {len(chunks)} chunks")
+        
         # CRITICAL FIX: Ensure metadata is properly set for each chunk
         company_id_slug = metadata.get("company_id_slug") if metadata else None
         if not company_id_slug:
-            logger.error(f"No company_id_slug in metadata for {fname}")
+            logger.error(f"[EMBED] CRITICAL: No company_id_slug in metadata for {fname}")
             raise ValueError("company_id_slug is required for embedding")
         
-        # Add metadata to each chunk
+        logger.info(f"[EMBED] Using company_id_slug: '{company_id_slug}'")
+        
+        # Add metadata to each chunk with DEBUGGING
         for i, chunk in enumerate(chunks):
             # FIXED: Ensure company_id_slug is properly set in chunk metadata
             chunk.metadata = {
-                "company_id_slug": company_id_slug,  # CRITICAL: This must match filter
+                "company_id_slug": company_id_slug,  # CRITICAL: This must match filter exactly
                 "filename": fname,
                 "chunk_id": f"{fname}_{i}",
                 "source": fpath,
                 "uploaded_at": metadata.get("uploaded_at", time.time()),
                 "title": metadata.get("title", fname)
             }
+            
+            # Debug: Log first chunk metadata
+            if i == 0:
+                logger.info(f"[EMBED] Sample chunk {i} metadata: {chunk.metadata}")
+                logger.info(f"[EMBED] Sample chunk {i} content preview: {chunk.page_content[:200]}...")
             
             # Add content-based metadata
             content_lower = chunk.page_content.lower()
@@ -729,11 +758,14 @@ def embed_sop_worker(fpath, metadata=None):
         # FIXED: Create or load vector database with proper configuration
         global vectorstore
         if vectorstore is None:
+            logger.info("[EMBED] Creating new vectorstore")
             vectorstore = Chroma(
                 persist_directory=CHROMA_DIR, 
                 embedding_function=embedding,
                 collection_name="opsvoice_docs"
             )
+        
+        logger.info(f"[EMBED] Adding {len(chunks)} documents to vectorstore")
         
         # Add documents to vectorstore
         vectorstore.add_documents(chunks)
@@ -741,21 +773,89 @@ def embed_sop_worker(fpath, metadata=None):
         # IMPORTANT: Persist the changes
         vectorstore.persist()
         
-        logger.info(f"Successfully embedded {len(chunks)} chunks from {fname} for company {company_id_slug}")
+        logger.info(f"[EMBED] Successfully embedded {len(chunks)} chunks from {fname} for company {company_id_slug}")
         
-        # Verify embedding by testing retrieval
+        # CRITICAL: Verify embedding by testing retrieval immediately
+        test_filter = {CHROMADB_FILTER_KEY: {"company_id_slug": company_id_slug}}
+        logger.info(f"[EMBED] Testing retrieval with filter: {test_filter}")
+        
         test_results = vectorstore.similarity_search(
-            "test", 
-            k=1, 
-            filter={"company_id_slug": company_id_slug}
+            "test query", 
+            k=3,
+            **test_filter
         )
-        logger.info(f"Verification: Found {len(test_results)} test results for {company_id_slug}")
+        
+        logger.info(f"[EMBED] Verification: Found {len(test_results)} test results for {company_id_slug}")
+        if test_results:
+            logger.info(f"[EMBED] Test result sample metadata: {test_results[0].metadata}")
+        else:
+            logger.error(f"[EMBED] WARNING: No test results found immediately after embedding!")
         
         update_status(fname, {"status": "embedded", "chunk_count": len(chunks), **(metadata or {})})
         
     except Exception as e:
-        logger.error(f"Error embedding {fname}: {traceback.format_exc()}")
+        logger.error(f"[EMBED] Error embedding {fname}: {traceback.format_exc()}")
         update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
+
+def debug_retriever_search(vectorstore, query, company_id_slug, k=5):
+    """Debug function to test different retrieval methods"""
+    logger.info(f"[DEBUG] Starting retrieval debug for company: '{company_id_slug}'")
+    
+    results = {}
+    
+    # Test 1: No filter (get all documents)
+    try:
+        all_results = vectorstore.similarity_search(query, k=k)
+        results["no_filter"] = {
+            "count": len(all_results),
+            "sample_metadata": [doc.metadata for doc in all_results[:2]]
+        }
+        logger.info(f"[DEBUG] No filter: Found {len(all_results)} total documents")
+    except Exception as e:
+        results["no_filter"] = {"error": str(e)}
+        logger.error(f"[DEBUG] No filter failed: {e}")
+    
+    # Test 2: Try both filter keys
+    for filter_key in ["where", "filter"]:
+        try:
+            filter_dict = {filter_key: {"company_id_slug": company_id_slug}}
+            logger.info(f"[DEBUG] Testing with {filter_key}: {filter_dict}")
+            
+            filtered_results = vectorstore.similarity_search(
+                query, 
+                k=k, 
+                **filter_dict
+            )
+            
+            results[f"with_{filter_key}"] = {
+                "count": len(filtered_results),
+                "sample_metadata": [doc.metadata for doc in filtered_results[:2]]
+            }
+            
+            logger.info(f"[DEBUG] With {filter_key}: Found {len(filtered_results)} documents")
+            if filtered_results:
+                logger.info(f"[DEBUG] Sample metadata: {filtered_results[0].metadata}")
+                
+        except Exception as e:
+            results[f"with_{filter_key}"] = {"error": str(e)}
+            logger.error(f"[DEBUG] Filter {filter_key} failed: {e}")
+    
+    # Test 3: Check what company_id_slugs actually exist
+    try:
+        all_docs = vectorstore.similarity_search("", k=100)  # Get many docs
+        company_slugs = set()
+        for doc in all_docs:
+            if "company_id_slug" in doc.metadata:
+                company_slugs.add(doc.metadata["company_id_slug"])
+        
+        results["existing_companies"] = list(company_slugs)
+        logger.info(f"[DEBUG] Found company_id_slugs in vectorstore: {list(company_slugs)}")
+        
+    except Exception as e:
+        results["existing_companies"] = {"error": str(e)}
+        logger.error(f"[DEBUG] Company slug check failed: {e}")
+    
+    return results
 
 def update_status(filename, status):
     """Update document processing status with error handling"""
@@ -850,7 +950,7 @@ def home():
     return safe_json_response({
         "status": "ok", 
         "message": "🚀 OpsVoice RAG API is live!",
-        "version": "3.0.0-performance-optimized",
+        "version": "3.0.0-performance-optimized-debug",
         "features": [
             "smart_model_selection",
             "intelligent_caching", 
@@ -859,10 +959,13 @@ def home():
             "llm_based_fallback",
             "general_business_intelligence",
             "session_memory",
-            "performance_tracking"
+            "performance_tracking",
+            "chromadb_auto_detection",
+            "extensive_debugging"
         ],
         "data_path": DATA_PATH,
         "persistent_storage": os.path.exists("/data"),
+        "chromadb_filter_key": CHROMADB_FILTER_KEY,
         "performance": {
             "cache_hit_rate": f"{(performance_metrics['cache_hits'] / max(1, performance_metrics['total_queries']) * 100):.1f}%",
             "avg_response_time": f"{performance_metrics['avg_response_time']:.2f}s"
@@ -880,7 +983,8 @@ def healthz():
         "avg_response_time": performance_metrics.get("avg_response_time", 0),
         "data_path": DATA_PATH,
         "persistent_storage": os.path.exists("/data"),
-        "sop_files_count": len(glob.glob(os.path.join(SOP_FOLDER, "*.*")))
+        "sop_files_count": len(glob.glob(os.path.join(SOP_FOLDER, "*.*"))),
+        "chromadb_filter_key": CHROMADB_FILTER_KEY
     })
 
 @app.route("/metrics")
@@ -982,7 +1086,7 @@ def upload_sop():
 
 @app.route("/query", methods=["POST", "OPTIONS"])
 def query_sop():
-    """ENHANCED query processing with performance optimizations and FIXED retrieval"""
+    """ENHANCED query processing with EXTENSIVE debugging and FIXED retrieval"""
     if request.method == "OPTIONS":
         return "", 204
         
@@ -993,7 +1097,7 @@ def query_sop():
         try:
             payload = request.get_json(force=True, silent=True) or {}
         except Exception as e:
-            logger.error(f"JSON parse error: {e}")
+            logger.error(f"[QUERY] JSON parse error: {e}")
             return safe_json_response({
                 "answer": "Invalid request format. Please try again.",
                 "source": "error",
@@ -1005,6 +1109,8 @@ def query_sop():
         tenant = payload.get("company_id_slug", "").strip()
         session_id = payload.get("session_id") or f"{tenant}_{int(time.time())}"
         session_id = re.sub(r'[^a-zA-Z0-9_\-\.]', '', str(session_id))[:64]
+
+        logger.info(f"[QUERY] Processing query for company '{tenant}': {qtext[:100]}...")
 
         # Validate inputs
         if not qtext or len(qtext.strip()) < 3:
@@ -1034,6 +1140,7 @@ def query_sop():
         # PERFORMANCE OPTIMIZATION: Check cache first
         cached_response = get_cached_response(qtext, tenant)
         if cached_response:
+            logger.info(f"[QUERY] Cache hit for {tenant}")
             cached_response["session_id"] = session_id
             cached_response["cache_hit"] = True
             cached_response["response_time"] = round(time.time() - start_time, 2)
@@ -1043,7 +1150,7 @@ def query_sop():
         # Ensure vectorstore is available
         if not ensure_vectorstore():
             # If vectorstore fails, use general business intelligence
-            logger.warning("Vectorstore unavailable, using general business intelligence")
+            logger.warning("[QUERY] Vectorstore unavailable, using general business intelligence")
             general_response = get_general_business_response(qtext, tenant)
             general_response["session_id"] = session_id
             general_response["response_time"] = round(time.time() - start_time, 2)
@@ -1085,28 +1192,41 @@ def query_sop():
         optimal_llm = get_optimal_llm(complexity)
         expanded_query = expand_query_with_synonyms(qtext)
         
-        logger.info(f"Processing query for {tenant}: {qtext[:50]}... (complexity: {complexity}, model: {optimal_llm.model_name}, has_docs: {has_company_docs})")
+        logger.info(f"[QUERY] Company {tenant} has {len(company_docs)} documents")
+        logger.info(f"[QUERY] Complexity: {complexity}, Model: {optimal_llm.model_name}")
+        logger.info(f"[QUERY] Expanded query: {expanded_query}")
         
         company_answer = None
         
         if has_company_docs:
             # Try company-specific documents first
             try:
-                # CRITICAL FIX: Create retriever with proper filter
+                logger.info(f"[QUERY] Starting RAG processing for {tenant}")
+                
+                # DEBUGGING: Test retrieval extensively
+                debug_results = debug_retriever_search(vectorstore, expanded_query, tenant)
+                logger.info(f"[QUERY] Debug results: {debug_results}")
+                
+                # CRITICAL FIX: Use the correct filter key
+                filter_dict = {CHROMADB_FILTER_KEY: {"company_id_slug": tenant}}
+                logger.info(f"[QUERY] Using filter: {filter_dict}")
+                
+                # Create retriever with debugging
                 retriever = vectorstore.as_retriever(
                     search_kwargs={
                         "k": 5,
-                        CHROMADB_FILTER_KEY: {"company_id_slug": tenant}  # This MUST match metadata
+                        **filter_dict  # Use the correct filter key
                     }
                 )
                 
-                # Test retrieval with expanded query
+                # Test retrieval directly
                 test_docs = retriever.get_relevant_documents(expanded_query)
-                logger.info(f"Found {len(test_docs)} relevant company documents for query")
+                logger.info(f"[QUERY] Retriever found {len(test_docs)} documents")
                 
-                # Debug: Log metadata of retrieved docs
-                for i, doc in enumerate(test_docs[:2]):
-                    logger.info(f"Doc {i} metadata: {doc.metadata}")
+                # Log details of retrieved documents
+                for i, doc in enumerate(test_docs[:3]):
+                    logger.info(f"[QUERY] Doc {i} metadata: {doc.metadata}")
+                    logger.info(f"[QUERY] Doc {i} content preview: {doc.page_content[:200]}...")
                 
                 if test_docs:
                     # Get session memory
@@ -1122,14 +1242,18 @@ def query_sop():
                     )
                     
                     # Query the chain
+                    logger.info(f"[QUERY] Invoking LangChain with expanded query")
                     result = qa.invoke({"question": expanded_query})
                     answer = clean_text(result.get("answer", ""))
                     source_docs = result.get("source_documents", [])
                     
-                    logger.info(f"Company RAG answer length: {len(answer)} chars, source docs: {len(source_docs)}")
+                    logger.info(f"[QUERY] LangChain result - Answer length: {len(answer)}, Source docs: {len(source_docs)}")
+                    logger.info(f"[QUERY] Answer preview: {answer[:200]}...")
 
                     # Check if answer is helpful
                     if answer and not is_unhelpful_answer(answer) and len(answer.strip()) > 10:
+                        logger.info(f"[QUERY] Success! Using company-specific answer")
+                        
                         # PERFORMANCE OPTIMIZATION: Smart truncation
                         if len(answer.split()) > 150:
                             answer = smart_truncate(answer, 150)
@@ -1143,21 +1267,31 @@ def query_sop():
                             "session_id": session_id,
                             "model_used": optimal_llm.model_name,
                             "complexity": complexity,
-                            "response_time": round(time.time() - start_time, 2)
+                            "response_time": round(time.time() - start_time, 2),
+                            "debug_info": {
+                                "filter_used": filter_dict,
+                                "docs_retrieved": len(test_docs),
+                                "company_docs_available": len(company_docs),
+                                "chromadb_filter_key": CHROMADB_FILTER_KEY
+                            }
                         }
                         
                         # Cache successful responses
                         cache_response(qtext, tenant, company_answer)
                         update_metrics(time.time() - start_time, "sop")
                         return safe_json_response(company_answer)
+                    else:
+                        logger.warning(f"[QUERY] Answer was unhelpful: {answer[:100]}...")
                         
+                else:
+                    logger.warning(f"[QUERY] No documents retrieved for company {tenant}")
+                    
             except Exception as company_rag_error:
-                logger.error(f"Company RAG processing error: {company_rag_error}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                logger.error(f"[QUERY] Company RAG error: {traceback.format_exc()}")
                 # Continue to intelligent fallback
         
         # ENHANCED: Use LLM-based fallback for ALL companies
-        logger.info(f"Using intelligent fallback system for query: {qtext}")
+        logger.info(f"[QUERY] Using intelligent fallback system for query: {qtext}")
         
         # Analyze query intent and generate fallback
         company_name = tenant.replace('-', ' ').replace('_', ' ').title()
@@ -1177,7 +1311,13 @@ def query_sop():
                 "session_id": session_id,
                 "model_used": "gpt-3.5-turbo",
                 "complexity": complexity,
-                "response_time": round(time.time() - start_time, 2)
+                "response_time": round(time.time() - start_time, 2),
+                "debug_info": {
+                    "company_docs_count": len(company_docs),
+                    "vectorstore_loaded": vectorstore is not None,
+                    "fallback_reason": "no_relevant_docs_found",
+                    "chromadb_filter_key": CHROMADB_FILTER_KEY
+                }
             }
             
             # Cache fallback responses too
@@ -1198,6 +1338,13 @@ def query_sop():
         else:
             general_response["answer"] += f"\n\nI also searched your {len(company_docs)} uploaded company documents but didn't find specific information about this topic."
         
+        general_response["debug_info"] = {
+            "company_docs_count": len(company_docs),
+            "vectorstore_loaded": vectorstore is not None,
+            "fallback_reason": "general_business_fallback",
+            "chromadb_filter_key": CHROMADB_FILTER_KEY
+        }
+        
         # Cache general business responses too
         cache_response(qtext, tenant, general_response)
         update_metrics(time.time() - start_time, "general_business")
@@ -1205,7 +1352,7 @@ def query_sop():
         return safe_json_response(general_response)
 
     except Exception as e:
-        logger.error(f"Query error: {traceback.format_exc()}")
+        logger.error(f"[QUERY] Error: {traceback.format_exc()}")
         update_metrics(time.time() - start_time, "error")
         
         # Return user-friendly error with session preservation
@@ -1470,7 +1617,7 @@ def clear_sessions():
         "message": f"Cleared {session_count} conversation sessions"
     })
 
-# ---- Admin/Debug Routes ----
+# ---- Debug/Admin Routes ----
 @app.route("/debug/status")
 def debug_status():
     """Debug endpoint for checking system status"""
@@ -1485,7 +1632,66 @@ def debug_status():
         "cache_size": len(query_cache),
         "cache_hit_rate": f"{cache_hit_rate:.1f}%",
         "active_sessions": len(conversation_sessions),
+        "chromadb_filter_key": CHROMADB_FILTER_KEY,
         "metrics": performance_metrics
+    })
+
+@app.route("/debug/retrieval-test/<company_id>")
+def debug_retrieval_test(company_id):
+    """Debug endpoint to test retrieval for a specific company"""
+    if not validate_company_id(company_id):
+        return safe_json_response({"error": "Invalid company ID"}, 400)
+    
+    try:
+        if not vectorstore:
+            return safe_json_response({"error": "Vectorstore not loaded"}, 500)
+        
+        test_query = "customer service procedure"
+        debug_results = debug_retriever_search(vectorstore, test_query, company_id)
+        
+        return safe_json_response({
+            "company_id": company_id,
+            "test_query": test_query,
+            "chromadb_filter_key": CHROMADB_FILTER_KEY,
+            "debug_results": debug_results
+        })
+        
+    except Exception as e:
+        logger.error(f"[DEBUG] Retrieval test error: {traceback.format_exc()}")
+        return safe_json_response({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }, 500)
+
+@app.route("/quick-fix-test/<company_id>")
+def quick_fix_test(company_id):
+    """Quick test to determine the correct filter method"""
+    if not vectorstore:
+        return safe_json_response({"error": "Vectorstore not loaded"}, 500)
+    
+    results = {}
+    
+    # Test both filter methods
+    for filter_key in ["where", "filter"]:
+        try:
+            test_filter = {filter_key: {"company_id_slug": company_id}}
+            docs = vectorstore.similarity_search("test", k=3, **test_filter)
+            results[filter_key] = {
+                "works": True,
+                "count": len(docs),
+                "sample_metadata": docs[0].metadata if docs else None
+            }
+        except Exception as e:
+            results[filter_key] = {
+                "works": False,
+                "error": str(e)
+            }
+    
+    return safe_json_response({
+        "company_id": company_id,
+        "filter_tests": results,
+        "recommendation": "Use 'where' if it works, otherwise 'filter'",
+        "current_setting": CHROMADB_FILTER_KEY
     })
 
 @app.route("/debug/vectorstore-test/<company_id>", methods=["GET"])
@@ -1502,20 +1708,21 @@ def debug_vectorstore_test(company_id):
         test_results = vectorstore.similarity_search(
             "test query",
             k=5,
-            filter={"company_id_slug": company_id}
+            **{CHROMADB_FILTER_KEY: {"company_id_slug": company_id}}
         )
         
         # Get all chunks for this company
         all_results = vectorstore.similarity_search(
             "",  # Empty query to get all
             k=100,
-            filter={"company_id_slug": company_id}
+            **{CHROMADB_FILTER_KEY: {"company_id_slug": company_id}}
         )
         
         return safe_json_response({
             "company_id": company_id,
             "test_results_count": len(test_results),
             "total_chunks_found": len(all_results),
+            "chromadb_filter_key": CHROMADB_FILTER_KEY,
             "sample_chunks": [
                 {
                     "content": doc.page_content[:200] + "...",
@@ -1582,9 +1789,10 @@ def payload_too_large(error):
 # ---- Startup Functions ----
 def startup_initialization():
     """Initialize system on startup - NO DATA WIPING"""
-    logger.info("=== OpsVoice API Startup (Performance Optimized) ===")
+    logger.info("=== OpsVoice API Startup (Performance Optimized with ChromaDB Debug) ===")
     logger.info(f"Data path: {DATA_PATH}")
     logger.info(f"Persistent storage: {os.path.exists('/data')}")
+    logger.info(f"ChromaDB filter key: {CHROMADB_FILTER_KEY}")
     
     # Load existing vectorstore (don't wipe it!)
     logger.info("Loading existing vector store...")
@@ -1610,6 +1818,8 @@ def startup_initialization():
     logger.info("- Persistent vectorstore connection")
     logger.info("- Smart response truncation")
     logger.info("- LLM-based fallback for all companies")
+    logger.info("- Auto-detection of ChromaDB filter key")
+    logger.info("- Extensive debugging and logging")
     logger.info("- Fixed embedding with proper company_id_slug metadata")
 
 if __name__ == "__main__":
@@ -1618,7 +1828,12 @@ if __name__ == "__main__":
     # Initialize system without wiping data
     startup_initialization()
     
-    logger.info(f"Starting Performance-Optimized OpsVoice API v3.0.0 on port {port}")
+    logger.info(f"Starting ChromaDB-Fixed OpsVoice API v3.0.0-debug on port {port}")
     logger.info("Target response time: <8 seconds")
     logger.info("🎯 Ready for production use - works with ANY uploaded documents!")
+    logger.info("🔧 Debug endpoints available:")
+    logger.info("   /debug/retrieval-test/<company_id>")
+    logger.info("   /quick-fix-test/<company_id>")
+    logger.info("   /debug/vectorstore-test/<company_id>")
+    logger.info("   /debug/status")
     app.run(host="0.0.0.0", port=port, debug=False)
