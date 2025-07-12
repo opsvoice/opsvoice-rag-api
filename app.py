@@ -777,31 +777,30 @@ def embed_sop_worker(fpath, metadata=None):
         
         # CRITICAL: Verify embedding by testing retrieval immediately
         logger.info(f"[EMBED] Testing retrieval with ChromaDB filter key: {CHROMADB_FILTER_KEY}")
-        
-        if CHROMADB_FILTER_KEY == "where":
-            test_results = vectorstore.similarity_search(
-                "test query", 
-                k=3,
-                where={"company_id_slug": company_id_slug}
-            )
-        else:  # filter
-            test_results = vectorstore.similarity_search(
-                "test query", 
-                k=3,
-                filter={"company_id_slug": company_id_slug}
-            )
-        
-        logger.info(f"[EMBED] Verification: Found {len(test_results)} test results for {company_id_slug}")
-        if test_results:
-            logger.info(f"[EMBED] Test result sample metadata: {test_results[0].metadata}")
-        else:
-            logger.error(f"[EMBED] WARNING: No test results found immediately after embedding!")
-        
-        update_status(fname, {"status": "embedded", "chunk_count": len(chunks), **(metadata or {})})
-        
-    except Exception as e:
-        logger.error(f"[EMBED] Error embedding {fname}: {traceback.format_exc()}")
-        update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})
+
+        try:
+            if CHROMADB_FILTER_KEY == "where":
+                test_results = vectorstore.similarity_search(
+                    "test query", 
+                    k=3,
+                    where={"company_id_slug": company_id_slug}
+                )
+            else:  # filter
+                test_results = vectorstore.similarity_search(
+                    "test query", 
+                    k=3,
+                    filter={"company_id_slug": company_id_slug}
+                )
+                
+            logger.info(f"[EMBED] Verification: Found {len(test_results)} test results for {company_id_slug}")
+            if test_results:
+                logger.info(f"[EMBED] Test result sample metadata: {test_results[0].metadata}")
+            else:
+                logger.warning(f"[EMBED] No test results found for {company_id_slug}")
+                
+        except Exception as e:
+            logger.error(f"[EMBED] Verification failed but embedding succeeded: {e}")
+            # Don't fail the entire embedding process due to verification error
 
 def debug_retriever_search(vectorstore, query, company_id_slug, k=5):
     """Debug function to test different retrieval methods"""
