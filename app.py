@@ -21,7 +21,7 @@ from chromadb.config import Settings
 
 # Determine correct search filter key for the installed chromadb version
 # ChromaDB <1.0 expects 'filter' while newer versions switched to 'where'.
-CHROMADB_FILTER_KEY = "filter"
+CHROMADB_FILTER_KEY = "where"
 
 load_dotenv()
 
