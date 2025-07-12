@@ -776,14 +776,20 @@ def embed_sop_worker(fpath, metadata=None):
         logger.info(f"[EMBED] Successfully embedded {len(chunks)} chunks from {fname} for company {company_id_slug}")
         
         # CRITICAL: Verify embedding by testing retrieval immediately
-        test_filter = {CHROMADB_FILTER_KEY: {"company_id_slug": company_id_slug}}
-        logger.info(f"[EMBED] Testing retrieval with filter: {test_filter}")
+        logger.info(f"[EMBED] Testing retrieval with ChromaDB filter key: {CHROMADB_FILTER_KEY}")
         
-        test_results = vectorstore.similarity_search(
-            "test query", 
-            k=3,
-            **test_filter
-        )
+        if CHROMADB_FILTER_KEY == "where":
+            test_results = vectorstore.similarity_search(
+                "test query", 
+                k=3,
+                where={"company_id_slug": company_id_slug}
+            )
+        else:  # filter
+            test_results = vectorstore.similarity_search(
+                "test query", 
+                k=3,
+                filter={"company_id_slug": company_id_slug}
+            )
         
         logger.info(f"[EMBED] Verification: Found {len(test_results)} test results for {company_id_slug}")
         if test_results:
