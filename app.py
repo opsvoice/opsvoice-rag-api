@@ -12,12 +12,12 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-import secrets
 from datetime import datetime, timedelta
+from chromadb.config import Settings
+import secrets
 import traceback
 import logging
 import chromadb
-from chromadb.config import Settings
 import pkg_resources
 
 load_dotenv()
@@ -1095,286 +1095,200 @@ def upload_sop():
         logger.error(f"Upload error: {traceback.format_exc()}")
         return safe_json_response({"error": "Upload failed"}, 500)
 
-@app.route("/query", methods=["POST", "OPTIONS"])
+@app.route("/query", methods=["POST"])
 def query_sop():
-    """ENHANCED query processing with EXTENSIVE debugging and FIXED retrieval"""
-    if request.method == "OPTIONS":
-        return "", 204
-        
+    """Enhanced query processing with session memory and performance optimization"""
     start_time = time.time()
     
     try:
-        # Parse request with better error handling
-        try:
-            payload = request.get_json(force=True, silent=True) or {}
-        except Exception as e:
-            logger.error(f"[QUERY] JSON parse error: {e}")
-            return safe_json_response({
-                "answer": "Invalid request format. Please try again.",
-                "source": "error",
-                "followups": [],
-                "session_id": None
-            }, 400)
-        
+        # Get and validate inputs
+        payload = request.get_json() or {}
         qtext = sanitize_text(payload.get("query", ""))
-        tenant = payload.get("company_id_slug", "").strip()
-        session_id = payload.get("session_id") or f"{tenant}_{int(time.time())}"
-        session_id = re.sub(r'[^a-zA-Z0-9_\-\.]', '', str(session_id))[:64]
+        tenant = payload.get("company_id_slug", "").strip()  # ← ADD THIS LINE
+        
+        if not qtext or not validate_company_id(tenant):
+            return safe_json_response({"error": "Invalid inputs"}, 400)
 
-        logger.info(f"[QUERY] Processing query for company '{tenant}': {qtext[:100]}...")
-
-        # Validate inputs
-        if not qtext or len(qtext.strip()) < 3:
-            return safe_json_response({
-                "answer": "Please ask a more specific question.",
-                "source": "error",
-                "followups": ["What procedure are you looking for?"],
-                "session_id": session_id
-            })
-            
-        if not validate_company_id(tenant):
-            return safe_json_response({
-                "answer": "Invalid company identifier.",
-                "source": "error",
-                "followups": [],
-                "session_id": session_id
-            }, 400)
-            
         if not check_rate_limit(tenant):
-            return safe_json_response({
-                "answer": "Too many requests. Please wait a moment.",
-                "source": "error",
-                "followups": [],
-                "session_id": session_id
-            }, 429)
-
-        # PERFORMANCE OPTIMIZATION: Check cache first
+            return safe_json_response({"error": "Too many requests"}, 429)
+        
         cached_response = get_cached_response(qtext, tenant)
         if cached_response:
-            logger.info(f"[QUERY] Cache hit for {tenant}")
-            cached_response["session_id"] = session_id
-            cached_response["cache_hit"] = True
-            cached_response["response_time"] = round(time.time() - start_time, 2)
-            update_metrics(time.time() - start_time, "cache")
-            return safe_json_response(cached_response)
-
-        # Ensure vectorstore is available
+            cached_response["session_id"] = payload.get("session_id", f"{tenant}_{secrets.token_hex(8)}")
+            return jsonify(cached_response)
+        
+        # Ensure vectorstore
         if not ensure_vectorstore():
-            # If vectorstore fails, use general business intelligence
-            logger.warning("[QUERY] Vectorstore unavailable, using general business intelligence")
-            general_response = get_general_business_response(qtext, tenant)
-            general_response["session_id"] = session_id
-            general_response["response_time"] = round(time.time() - start_time, 2)
-            performance_metrics["response_sources"]["general_business"] += 1
-            update_metrics(time.time() - start_time, "general_business")
-            return safe_json_response(general_response)
-
-        # Handle vague queries
-        if is_vague(qtext):
-            response = {
-                "answer": "Could you please be more specific? What procedure or policy are you looking for?",
-                "source": "clarify",
-                "followups": ["How do I handle customer complaints?", "What's the refund procedure?", "Where are the training documents?"],
-                "session_id": session_id,
-                "response_time": round(time.time() - start_time, 2)
-            }
-            update_metrics(time.time() - start_time, "clarify")
-            return safe_json_response(response)
-
-        # Filter off-topic queries
-        off_topic_keywords = ["gmail", "facebook", "amazon", "weather", "news", "stock", "crypto", "youtube", "instagram"]
-        if any(keyword in qtext.lower() for keyword in off_topic_keywords):
-            response = {
-                "answer": "Please ask questions about your company procedures and policies.",
-                "source": "off_topic",
-                "followups": ["What are our customer service procedures?", "How do I process a refund?", "What's the onboarding process?"],
-                "session_id": session_id,
-                "response_time": round(time.time() - start_time, 2)
-            }
-            update_metrics(time.time() - start_time, "off_topic")
-            return safe_json_response(response)
-
-        # Check if company has documents
-        company_docs = get_company_documents_internal(tenant)
-        has_company_docs = len(company_docs) > 0
-
-        # PERFORMANCE OPTIMIZATION: Get query complexity and optimal model
+            return safe_json_response({"error": "Service unavailable"}, 503)
+        
+        # Performance optimization - select optimal model
         complexity = get_query_complexity(qtext)
         optimal_llm = get_optimal_llm(complexity)
         expanded_query = expand_query_with_synonyms(qtext)
         
+        logger.info(f"[QUERY] Processing query for company '{tenant}': {qtext[:50]}...")
+        
+        # Check for vague queries
+        if is_vague(qtext):
+            response = {
+                "answer": "Can you give me more detail—like the specific SOP or process you're referring to?",
+                "source": "clarify"
+            }
+            update_metrics(time.time() - start_time, "clarify")
+            return jsonify(response)
+
+        # Filter out off-topic queries
+        off_topic_keywords = ["gmail", "facebook", "amazon account", "weather", "news", "stock price"]
+        if any(keyword in qtext.lower() for keyword in off_topic_keywords):
+            response = {
+                "answer": "That's outside your company SOPs—please use the official help portal or ask about your internal procedures.",
+                "source": "off_topic"
+            }
+            update_metrics(time.time() - start_time, "off_topic")
+            return jsonify(response)
+
+        # GET COMPANY DOCUMENTS COUNT FOR DEBUGGING
+        company_docs = get_company_documents_internal(tenant)
         logger.info(f"[QUERY] Company {tenant} has {len(company_docs)} documents")
+        
+        # ENHANCED: Add query complexity info
         logger.info(f"[QUERY] Complexity: {complexity}, Model: {optimal_llm.model_name}")
         logger.info(f"[QUERY] Expanded query: {expanded_query}")
         
-        company_answer = None
+        # START MAIN RAG PROCESSING
+        logger.info(f"[QUERY] Starting RAG processing for {tenant}")
         
-        if has_company_docs:
-            # Try company-specific documents first
+        try:
+            # DEBUGGING: Test both filter methods
+            debug_results = debug_retriever_search(vectorstore, expanded_query, tenant)
+            logger.info(f"[QUERY] Debug results: {debug_results}")
+            
+            # FIXED: Use the method that works from debug results
+            if CHROMADB_FILTER_KEY == "where":
+                filter_dict = {"where": {"company_id_slug": tenant}}
+            else:
+                filter_dict = {"filter": {"company_id_slug": tenant}}
+            
+            logger.info(f"[QUERY] Using filter: {filter_dict}")
+            
+            # Method 1: Try similarity_search directly with filter
             try:
-                logger.info(f"[QUERY] Starting RAG processing for {tenant}")
+                relevant_docs = vectorstore.similarity_search(
+                    expanded_query,
+                    k=5,
+                    **filter_dict
+                )
+                logger.info(f"[QUERY] Direct search found {len(relevant_docs)} docs")
                 
-                # DEBUGGING: Test retrieval extensively
-                debug_results = debug_retriever_search(vectorstore, expanded_query, tenant)
-                logger.info(f"[QUERY] Debug results: {debug_results}")
+            except Exception as e:
+                logger.error(f"[QUERY] Direct search failed: {e}")
+                # Method 2: Fallback to no filter
+                relevant_docs = vectorstore.similarity_search(expanded_query, k=10)
+                # Filter manually
+                relevant_docs = [doc for doc in relevant_docs 
+                               if doc.metadata.get("company_id_slug") == tenant]
+                logger.info(f"[QUERY] Manual filter found {len(relevant_docs)} docs")
+            
+            if relevant_docs:
+                logger.info(f"[QUERY] Found {len(relevant_docs)} relevant documents")
                 
-                # CRITICAL FIX: Use the correct filter key
-                filter_dict = {CHROMADB_FILTER_KEY: {"company_id_slug": tenant}}
-                logger.info(f"[QUERY] Using filter: {filter_dict}")
+                # Get session memory
+                session_id = payload.get("session_id", f"{tenant}_{secrets.token_hex(8)}")
+                memory = get_session_memory(session_id)
                 
-                # Create retriever with debugging
-                retriever = vectorstore.as_retriever(
-                    search_kwargs={
-                        "k": 5,
-                        **filter_dict  # Use the correct filter key
-                    }
+                # Create a simple QA chain (no retriever conflicts)
+                from langchain.chains.question_answering import load_qa_chain
+                
+                qa_chain = load_qa_chain(
+                    optimal_llm,
+                    chain_type="stuff"
                 )
                 
-                # Test retrieval directly
-                test_docs = retriever.get_relevant_documents(expanded_query)
-                logger.info(f"[QUERY] Retriever found {len(test_docs)} documents")
+                # Run QA on the retrieved documents
+                result = qa_chain.invoke({
+                    "input_documents": relevant_docs,
+                    "question": expanded_query
+                })
                 
-                # Log details of retrieved documents
-                for i, doc in enumerate(test_docs[:3]):
-                    logger.info(f"[QUERY] Doc {i} metadata: {doc.metadata}")
-                    logger.info(f"[QUERY] Doc {i} content preview: {doc.page_content[:200]}...")
+                answer = clean_text(result.get("output_text", ""))
                 
-                if test_docs:
-                    # Get session memory
-                    memory = get_session_memory(session_id)
+                if answer and not is_unhelpful_answer(answer):
+                    # Smart truncation
+                    if len(answer.split()) > 150:
+                        answer = smart_truncate(answer, 150)
+                   
+                    response = {
+                        "answer": answer,
+                        "fallback_used": False,
+                        "followups": generate_contextual_followups(qtext, answer),
+                        "source": "company_docs",
+                        "source_documents": len(relevant_docs),
+                        "session_id": session_id,
+                        "model_used": optimal_llm.model_name
+                    }
                     
-                    # Create conversational chain
-                    qa = ConversationalRetrievalChain.from_llm(
-                        optimal_llm,
-                        retriever=retriever,
-                        memory=memory,
-                        return_source_documents=True,
-                        verbose=True  # Add verbose for debugging
-                    )
+                    cache_response(qtext, tenant, response)
+                    update_metrics(time.time() - start_time, "sop")
+                    logger.info(f"[QUERY] Success! Returning company document answer")
+                    return jsonify(response)
                     
-                    # Query the chain
-                    logger.info(f"[QUERY] Invoking LangChain with expanded query")
-                    result = qa.invoke({"question": expanded_query})
-                    answer = clean_text(result.get("answer", ""))
-                    source_docs = result.get("source_documents", [])
-                    
-                    logger.info(f"[QUERY] LangChain result - Answer length: {len(answer)}, Source docs: {len(source_docs)}")
-                    logger.info(f"[QUERY] Answer preview: {answer[:200]}...")
+            # No relevant docs found - use intelligent fallback
+            logger.info(f"[QUERY] No relevant docs found, using intelligent fallback")
+            
+        except Exception as e:
+            logger.error(f"[QUERY] Company RAG error: {traceback.format_exc()}")
+            # Continue to fallback
 
-                    # Check if answer is helpful
-                    if answer and not is_unhelpful_answer(answer) and len(answer.strip()) > 10:
-                        logger.info(f"[QUERY] Success! Using company-specific answer")
-                        
-                        # PERFORMANCE OPTIMIZATION: Smart truncation
-                        if len(answer.split()) > 150:
-                            answer = smart_truncate(answer, 150)
-                            
-                        company_answer = {
-                            "answer": answer,
-                            "fallback_used": False,
-                            "followups": generate_contextual_followups(qtext, answer),
-                            "source": "company_docs",
-                            "source_documents": len(source_docs),
-                            "session_id": session_id,
-                            "model_used": optimal_llm.model_name,
-                            "complexity": complexity,
-                            "response_time": round(time.time() - start_time, 2),
-                            "debug_info": {
-                                "filter_used": filter_dict,
-                                "docs_retrieved": len(test_docs),
-                                "company_docs_available": len(company_docs),
-                                "chromadb_filter_key": CHROMADB_FILTER_KEY
-                            }
-                        }
-                        
-                        # Cache successful responses
-                        cache_response(qtext, tenant, company_answer)
-                        update_metrics(time.time() - start_time, "sop")
-                        return safe_json_response(company_answer)
-                    else:
-                        logger.warning(f"[QUERY] Answer was unhelpful: {answer[:100]}...")
-                        
-                else:
-                    logger.warning(f"[QUERY] No documents retrieved for company {tenant}")
-                    
-            except Exception as company_rag_error:
-                logger.error(f"[QUERY] Company RAG error: {traceback.format_exc()}")
-                # Continue to intelligent fallback
-        
-        # ENHANCED: Use LLM-based fallback for ALL companies
+        # ENHANCED: Use LLM-based intelligent fallback
         logger.info(f"[QUERY] Using intelligent fallback system for query: {qtext}")
         
-        # Analyze query intent and generate fallback
-        company_name = tenant.replace('-', ' ').replace('_', ' ').title()
-        query_category = analyze_query_intent_with_llm(qtext, company_name)
-        fallback_answer = generate_fallback_response(qtext, company_name, query_category)
-        
-        # If fallback is good, use it
-        if fallback_answer and len(fallback_answer) > 50:
-            if len(fallback_answer.split()) > 150:
-                fallback_answer = smart_truncate(fallback_answer, 150)
-                
-            fallback_response = {
-                "answer": fallback_answer,
-                "followups": generate_contextual_followups(qtext, fallback_answer),
-                "source": "intelligent_fallback",
-                "category": query_category,
-                "session_id": session_id,
-                "model_used": "gpt-3.5-turbo",
-                "complexity": complexity,
-                "response_time": round(time.time() - start_time, 2),
+        try:
+            # Try the general business intelligence system
+            business_response = get_general_business_response(qtext, tenant)
+            
+            response = {
+                "answer": business_response["answer"],
+                "fallback_used": True,
+                "followups": business_response.get("followups", generate_contextual_followups(qtext, business_response["answer"])),
+                "source": business_response.get("source", "general_business"),
+                "session_id": payload.get("session_id", f"{tenant}_{secrets.token_hex(8)}"),
+                "category": business_response.get("category", "general"),
                 "debug_info": {
+                    "chromadb_filter_key": CHROMADB_FILTER_KEY,
                     "company_docs_count": len(company_docs),
-                    "vectorstore_loaded": vectorstore is not None,
                     "fallback_reason": "no_relevant_docs_found",
-                    "chromadb_filter_key": CHROMADB_FILTER_KEY
+                    "vectorstore_loaded": True
                 }
             }
             
-            # Cache fallback responses too
-            cache_response(qtext, tenant, fallback_response)
             update_metrics(time.time() - start_time, "general_business")
-            performance_metrics["response_sources"]["general_business"] += 1
-            return safe_json_response(fallback_response)
-        
-        # Final fallback: General business intelligence
-        general_response = get_general_business_response(qtext, tenant)
-        general_response["session_id"] = session_id
-        general_response["response_time"] = round(time.time() - start_time, 2)
-        
-        # Add context about company documents
-        if not has_company_docs:
-            general_response["answer"] += f"\n\nTo get answers specific to your company's procedures, consider uploading your business documents, policies, and handbooks."
-            general_response["followups"].append("How do I upload company documents?")
-        else:
-            general_response["answer"] += f"\n\nI also searched your {len(company_docs)} uploaded company documents but didn't find specific information about this topic."
-        
-        general_response["debug_info"] = {
-            "company_docs_count": len(company_docs),
-            "vectorstore_loaded": vectorstore is not None,
-            "fallback_reason": "general_business_fallback",
-            "chromadb_filter_key": CHROMADB_FILTER_KEY
-        }
-        
-        # Cache general business responses too
-        cache_response(qtext, tenant, general_response)
-        update_metrics(time.time() - start_time, "general_business")
-        performance_metrics["response_sources"]["general_business"] += 1
-        return safe_json_response(general_response)
+            return jsonify(response)
+            
+        except Exception as fallback_error:
+            logger.error(f"[QUERY] Fallback system error: {fallback_error}")
+            
+            # Ultimate fallback
+            response = {
+                "answer": f"""I'm having trouble processing your question right now. 
+                
+For {tenant.replace('-', ' ').title()}, please try:
+- Ask about specific procedures or policies
+- Check if your documents have been uploaded successfully
+- Contact your supervisor for immediate assistance
+
+I can help with customer service, operations, and general business questions.""",
+                "fallback_used": True,
+                "followups": ["How do I upload documents?", "What can you help with?", "Try a simpler question"],
+                "source": "error_fallback",
+                "session_id": payload.get("session_id", f"{tenant}_{secrets.token_hex(8)}")
+            }
+            
+            update_metrics(time.time() - start_time, "error")
+            return jsonify(response)
 
     except Exception as e:
-        logger.error(f"[QUERY] Error: {traceback.format_exc()}")
-        update_metrics(time.time() - start_time, "error")
-        
-        # Return user-friendly error with session preservation
-        return safe_json_response({
-            "answer": "I encountered an error processing your request. Please try asking your question differently.",
-            "source": "error",
-            "followups": ["Ask a different question", "Try a simpler query", "Check if your documents are uploaded"],
-            "session_id": session_id,
-            "response_time": round(time.time() - start_time, 2),
-            "error_details": str(e) if app.debug else None
-        }, 500)
+        logger.error(f"[QUERY ERROR] {traceback.format_exc()}")
+        return safe_json_response({"error": "Query processing failed"}, 500)
 
 @app.route("/voice-reply", methods=["POST", "OPTIONS"])
 def voice_reply():
