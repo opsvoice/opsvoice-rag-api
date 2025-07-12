@@ -802,6 +802,12 @@ def embed_sop_worker(fpath, metadata=None):
             logger.error(f"[EMBED] Verification failed but embedding succeeded: {e}")
             # Don't fail the entire embedding process due to verification error
 
+        update_status(fname, {"status": "embedded", "chunk_count": len(chunks), **(metadata or {})})
+        
+    except Exception as e:
+        logger.error(f"[EMBED] Error embedding {fname}: {traceback.format_exc()}")
+        update_status(fname, {"status": f"error: {str(e)}", **(metadata or {})})    
+
 def debug_retriever_search(vectorstore, query, company_id_slug, k=5):
     """Debug function to test different retrieval methods"""
     logger.info(f"[DEBUG] Starting retrieval debug for company: '{company_id_slug}'")
