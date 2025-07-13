@@ -764,4 +764,109 @@ def query_sop():
             return jsonify({'error': 'Query is required'}), 400
         
         if len(query) > config.MAX_QUERY_LENGTH:
-            return jsonify({'error': f'Query too long. Maximum {config.MAX_QUERY_LENGTH} characters'}
+            return jsonify({'error': f'Query too long. Maximum {config.MAX_QUERY_LENGTH} characters'})  # <-- added closing )
+
+        # Smart caching
+        cache_result = cache_manager.get(query, company_id)
+        if cache_result:
+            performance_monitor.track_query(time.time() - start_time, cache_result.get('model_used', ''), 'cache', cache_hit=True)
+            return jsonify({
+                **cache_result,
+                'cache_hit': True,
+                'session_id': session_id,
+                'response_time': round(time.time() - start_time, 3)
+            })
+
+        # Get or create session memory
+        memory = session_manager.get_conversation_memory(session_id)
+
+        # Select model
+        complexity = get_query_complexity(query)
+        llm = get_optimal_llm(complexity)
+        model_used = llm.model_name if hasattr(llm, "model_name") else "unknown"
+
+        # Run retrieval-augmented generation
+        try:
+            retriever = vector_store_manager.vectorstore.as_retriever(
+                search_kwargs={"k": config.RETRIEVAL_K, "filter": {"company_id_slug": company_id}}
+            )
+            rag_chain = ConversationalRetrievalChain.from_llm(
+                llm=llm,
+                retriever=retriever,
+                memory=memory
+            )
+            result = rag_chain({"question": query})
+
+            answer = result["answer"].strip()
+            # Save conversation memory
+            session_manager.save_conversation_memory(session_id, memory)
+
+            # Optionally generate followups
+            followups = generate_followup_questions(query, answer)
+
+            # Prepare response
+            response = {
+                "answer": answer,
+                "source": "company-data",
+                "followups": followups,
+                "model_used": model_used,
+                "session_id": session_id,
+                "response_time": round(time.time() - start_time, 3),
+            }
+
+            # Cache for fast retrieval next time
+            cache_manager.set(query, company_id, response)
+            performance_monitor.track_query(time.time() - start_time, model_used, "company-data", cache_hit=False)
+
+            return jsonify(response)
+        except Exception as e:
+            logger.error(f"Query error: {e}")
+            return jsonify({"error": "Internal error processing query."}), 500
+
+# Example: voice-reply endpoint (add if you need TTS directly)
+@app.route('/voice-reply', methods=['POST'])
+@validate_company_id
+def voice_reply():
+    """Return audio reply for a given text answer"""
+    data = request.get_json()
+    text = data.get("query", "")
+    company_id = data.get("company_id_slug", "")
+    cache_key = hashlib.sha256((company_id + ":" + text).encode()).hexdigest()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        audio_bytes = loop.run_until_complete(audio_service.generate_audio_async(text, cache_key))
+        return send_file(
+            io.BytesIO(audio_bytes),
+            mimetype="audio/mpeg",
+            as_attachment=False,
+            download_name="response.mp3"
+        )
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return jsonify({"error": "Audio generation failed"}), 500
+
+# Example: company-docs endpoint
+@app.route('/company-docs/<company_id_slug>')
+@validate_company_id
+def company_docs(company_id_slug):
+    """List docs for a company"""
+    docs = []
+    try:
+        for filename in os.listdir(config.SOP_FOLDER):
+            if filename.startswith(company_id_slug + "_"):
+                path = os.path.join(config.SOP_FOLDER, filename)
+                stat = os.stat(path)
+                docs.append({
+                    "filename": filename,
+                    "file_size": stat.st_size,
+                    "status": "completed" if filename.endswith('.pdf') or filename.endswith('.docx') or filename.endswith('.txt') else "processing"
+                })
+        return jsonify(docs)
+    except Exception as e:
+        logger.error(f"List docs error: {e}")
+        return jsonify([])
+
+# Only for local testing; Render/Gunicorn ignore this
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
