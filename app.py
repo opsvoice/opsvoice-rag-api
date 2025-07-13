@@ -441,7 +441,7 @@ def limiter_key_func():
 
 limiter = Limiter(
     app=app,
-    key_func=limiter_key_func,    # <--- This line!
+    key_func=limiter_key_func,
     storage_uri=config.REDIS_URL if config.REDIS_URL else "memory://",
     default_limits=[
         f"{config.RATE_LIMIT_PER_MINUTE} per minute",
@@ -749,7 +749,6 @@ def upload_sop():
 def query_sop():
     """Process user query with RAG"""
     start_time = time.time()
-    
     try:
         data = request.get_json()
         if not data:
@@ -764,8 +763,8 @@ def query_sop():
             return jsonify({'error': 'Query is required'}), 400
         
         if len(query) > config.MAX_QUERY_LENGTH:
-            return jsonify({'error': f'Query too long. Maximum {config.MAX_QUERY_LENGTH} characters'})  # <-- added closing )
-
+            return jsonify({'error': f'Query too long. Maximum {config.MAX_QUERY_LENGTH} characters'})
+        
         # Smart caching
         cache_result = cache_manager.get(query, company_id)
         if cache_result:
@@ -786,48 +785,48 @@ def query_sop():
         model_used = llm.model_name if hasattr(llm, "model_name") else "unknown"
 
         # Run retrieval-augmented generation
-        try:
-            retriever = vector_store_manager.vectorstore.as_retriever(
-                search_kwargs={"k": config.RETRIEVAL_K, "filter": {"company_id_slug": company_id}}
-            )
-            rag_chain = ConversationalRetrievalChain.from_llm(
-                llm=llm,
-                retriever=retriever,
-                memory=memory
-            )
-            result = rag_chain({"question": query})
+        retriever = vector_store_manager.vectorstore.as_retriever(
+            search_kwargs={"k": config.RETRIEVAL_K, "filter": {"company_id_slug": company_id}}
+        )
+        rag_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=retriever,
+            memory=memory
+        )
+        result = rag_chain({"question": query})
 
-            answer = result["answer"].strip()
-            # Save conversation memory
-            session_manager.save_conversation_memory(session_id, memory)
+        answer = result["answer"].strip()
+        # Save conversation memory
+        session_manager.save_conversation_memory(session_id, memory)
 
-            # Optionally generate followups
-            followups = generate_followup_questions(query, answer)
+        # Optionally generate followups
+        followups = generate_followup_questions(query, answer)
 
-            # Prepare response
-            response = {
-                "answer": answer,
-                "source": "company-data",
-                "followups": followups,
-                "model_used": model_used,
-                "session_id": session_id,
-                "response_time": round(time.time() - start_time, 3),
-            }
+        # Prepare response
+        response = {
+            "answer": answer,
+            "source": "company-data",
+            "followups": followups,
+            "model_used": model_used,
+            "session_id": session_id,
+            "response_time": round(time.time() - start_time, 3),
+        }
 
-            # Cache for fast retrieval next time
-            cache_manager.set(query, company_id, response)
-            performance_monitor.track_query(time.time() - start_time, model_used, "company-data", cache_hit=False)
+        # Cache for fast retrieval next time
+        cache_manager.set(query, company_id, response)
+        performance_monitor.track_query(time.time() - start_time, model_used, "company-data", cache_hit=False)
 
-            return jsonify(response)
-        except Exception as e:
-            logger.error(f"Query error: {e}")
-            return jsonify({"error": "Internal error processing query."}), 500
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f"Query error: {e}")
+        return jsonify({"error": "Internal error processing query."}), 500
 
 # Example: voice-reply endpoint (add if you need TTS directly)
 @app.route('/voice-reply', methods=['POST'])
 @validate_company_id
 def voice_reply():
     """Return audio reply for a given text answer"""
+    import io
     data = request.get_json()
     text = data.get("query", "")
     company_id = data.get("company_id_slug", "")
