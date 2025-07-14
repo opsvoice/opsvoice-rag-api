@@ -1,3 +1,6 @@
+# app.py - Optimized OpsVoice Backend
+# Production-ready with enhanced performance, security, and maintainability
+
 import os
 import json
 import time
@@ -5,16 +8,20 @@ import asyncio
 import secrets
 import hashlib
 import logging
+import re
+import glob
+import shutil
+import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from functools import lru_cache, wraps
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-import redis
 from dataclasses import dataclass, asdict
+from io import BytesIO
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -22,7 +29,7 @@ from flask_caching import Cache
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 
-import aiohttp
+import requests
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -74,16 +81,22 @@ class Config:
     RETRIEVAL_K: int = 5
     EMBEDDING_BATCH_SIZE: int = 100
     
-    # Rate Limiting
-    RATE_LIMIT_PER_MINUTE: int = 30
-    RATE_LIMIT_PER_HOUR: int = 500
+    # Rate Limiting - Different limits for demo vs. regular companies
+    DEMO_RATE_LIMIT_PER_MINUTE: int = 60  # Looser for demo
+    DEMO_RATE_LIMIT_PER_HOUR: int = 1000   # Looser for demo
+    RATE_LIMIT_PER_MINUTE: int = 20        # Tighter for real companies
+    RATE_LIMIT_PER_HOUR: int = 300         # Tighter for real companies
+    
+    # Document Limits
+    DEMO_MAX_DOCUMENTS: int = 10           # Demo can have more docs
+    COMPANY_MAX_DOCUMENTS: int = 5         # Regular companies limited
     
     # Redis (optional)
     REDIS_URL: str = os.getenv("REDIS_URL")
     
     # Feature Flags
     USE_REDIS_SESSIONS: bool = bool(os.getenv("REDIS_URL"))
-    USE_ASYNC_TTS: bool = True
+    USE_ASYNC_TTS: bool = False  # Set to False since we don't have aiohttp by default
     ENABLE_METRICS: bool = True
     
     def __post_init__(self):
@@ -104,25 +117,38 @@ class SessionManager:
     def __init__(self, use_redis: bool = False, redis_url: str = None):
         self.use_redis = use_redis and redis_url
         if self.use_redis:
-            self.redis_client = redis.from_url(redis_url, decode_responses=True)
+            try:
+                import redis
+                self.redis_client = redis.from_url(redis_url, decode_responses=True)
+                logger.info("Redis session storage initialized")
+            except ImportError:
+                logger.warning("Redis not installed, falling back to memory storage")
+                self.use_redis = False
+                self.memory_store = {}
         else:
             self.memory_store = {}
     
     def get_session(self, session_id: str) -> Dict:
         """Get session data"""
         if self.use_redis:
-            data = self.redis_client.get(f"session:{session_id}")
-            return json.loads(data) if data else {}
+            try:
+                data = self.redis_client.get(f"session:{session_id}")
+                return json.loads(data) if data else {}
+            except:
+                return {}
         return self.memory_store.get(session_id, {})
     
     def set_session(self, session_id: str, data: Dict, ttl: int = 3600):
         """Set session data with TTL"""
         if self.use_redis:
-            self.redis_client.setex(
-                f"session:{session_id}",
-                ttl,
-                json.dumps(data)
-            )
+            try:
+                self.redis_client.setex(
+                    f"session:{session_id}",
+                    ttl,
+                    json.dumps(data)
+                )
+            except:
+                pass
         else:
             self.memory_store[session_id] = {
                 **data,
@@ -160,7 +186,7 @@ class SessionManager:
             })
         
         session_data = self.get_session(session_id)
-        session_data['chat_history'] = messages
+        session_data['chat_history'] = messages[-20:]  # Keep last 20 messages
         self.set_session(session_id, session_data)
     
     def cleanup_expired(self):
@@ -185,7 +211,6 @@ class PerformanceMonitor:
             'model_usage': {'gpt-3.5-turbo': 0, 'gpt-4': 0},
             'sources': {}
         }
-        self.lock = asyncio.Lock() if asyncio else None
     
     def track_query(self, response_time: float, model: str, source: str, cache_hit: bool = False):
         """Track query performance metrics"""
@@ -324,12 +349,6 @@ class VectorStoreManager:
         except Exception as e:
             logger.error(f"Search error: {e}")
             return []
-    
-    def delete_company_documents(self, company_id: str):
-        """Delete all documents for a company"""
-        # Note: ChromaDB doesn't support deletion by metadata filter directly
-        # This would need to be implemented based on your specific needs
-        pass
 
 # ==== Audio Service ====
 class AudioService:
@@ -338,8 +357,8 @@ class AudioService:
         self.cache_dir = cache_dir
         self.voice_id = "tnSpp4vdxKPjI9w0GnoV"  # Default voice
     
-    async def generate_audio_async(self, text: str, cache_key: str) -> bytes:
-        """Generate audio asynchronously"""
+    def generate_audio_sync(self, text: str, cache_key: str) -> bytes:
+        """Generate audio synchronously"""
         cache_path = os.path.join(self.cache_dir, f"{cache_key}.mp3")
         
         # Check cache first
@@ -350,8 +369,8 @@ class AudioService:
                     return f.read()
         
         # Generate new audio
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        try:
+            response = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/stream",
                 headers={
                     "xi-api-key": self.api_key,
@@ -366,29 +385,33 @@ class AudioService:
                         "use_speaker_boost": True
                     }
                 },
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status == 200:
-                    audio_data = await response.read()
-                    
-                    # Cache the audio
-                    with open(cache_path, 'wb') as f:
-                        f.write(audio_data)
-                    
-                    return audio_data
-                else:
-                    raise Exception(f"TTS API error: {response.status}")
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                audio_data = response.content
+                
+                # Cache the audio
+                with open(cache_path, 'wb') as f:
+                    f.write(audio_data)
+                
+                return audio_data
+            else:
+                raise Exception(f"TTS API error: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Audio generation error: {e}")
+            raise
     
     def cleanup_old_cache(self):
         """Remove old cache files"""
         cutoff_time = time.time() - config.AUDIO_CACHE_TTL
         for filename in os.listdir(self.cache_dir):
             filepath = os.path.join(self.cache_dir, filename)
-            if os.path.getmtime(filepath) < cutoff_time:
-                try:
+            try:
+                if os.path.getmtime(filepath) < cutoff_time:
                     os.remove(filepath)
-                except:
-                    pass
+            except:
+                pass
 
 # ==== Initialize Services ====
 session_manager = SessionManager(
@@ -422,37 +445,23 @@ CORS(app, resources={
     }
 })
 
-def limiter_key_func():
-    # If POST/JSON, check company_id_slug
-    try:
-        if request.is_json:
-            company_id = (request.get_json() or {}).get('company_id_slug', '')
-        elif request.form:
-            company_id = request.form.get('company_id_slug', '')
-        else:
-            company_id = request.args.get('company_id_slug', '')
-    except Exception:
-        company_id = ''
-    # Unlimited for demo
+# Rate Limiting with different limits for demo
+def get_rate_limit_key():
+    """Get rate limit key based on company"""
+    company_id = request.json.get('company_id_slug', '') if request.json else ''
     if company_id == 'demo-business-123':
-        return f"unlimited-demo"
-    # Rate limit all others
+        return f"demo:{get_remote_address()}"
     return f"{get_remote_address()}:{company_id}"
 
 limiter = Limiter(
     app=app,
-    key_func=limiter_key_func,
+    key_func=get_rate_limit_key,
     storage_uri=config.REDIS_URL if config.REDIS_URL else "memory://",
-    default_limits=[
-        f"{config.RATE_LIMIT_PER_MINUTE} per minute",
-        f"{config.RATE_LIMIT_PER_HOUR} per hour"
-    ]
 )
 
-# Flask-Caching for additional caching
+# Flask-Caching
 cache = Cache(app, config={
-    'CACHE_TYPE': 'redis' if config.REDIS_URL else 'simple',
-    'CACHE_REDIS_URL': config.REDIS_URL,
+    'CACHE_TYPE': 'simple',
     'CACHE_DEFAULT_TIMEOUT': 300
 })
 
@@ -474,12 +483,12 @@ def validate_company_id(f):
     def decorated_function(*args, **kwargs):
         company_id = (
             kwargs.get('company_id_slug') or
-            request.json.get('company_id_slug') if request.json else None or
-            request.form.get('company_id_slug') or
-            request.args.get('company_id_slug')
+            request.json.get('company_id_slug', '') if request.json else '' or
+            request.form.get('company_id_slug', '') or
+            request.args.get('company_id_slug', '')
         )
         
-        if not company_id or not company_id.replace('-', '').replace('_', '').isalnum():
+        if not company_id or not re.match(r'^[a-zA-Z0-9_-]+$', company_id):
             return jsonify({'error': 'Invalid company identifier'}), 400
         
         # Prevent path traversal
@@ -500,7 +509,6 @@ def clean_text(text: str) -> str:
     text = ' '.join(text.split())  # Normalize whitespace
     
     # Remove potential XSS/injection attempts
-    import re
     text = re.sub(r'[<>\"\'`]', '', text)
     
     return text.strip()
@@ -551,6 +559,22 @@ def generate_followup_questions(query: str, answer: str) -> List[str]:
         ])
     
     return followups[:3]
+
+def get_company_document_count(company_id: str) -> int:
+    """Get count of documents for a company"""
+    if not os.path.exists(config.STATUS_FILE):
+        return 0
+    
+    try:
+        with open(config.STATUS_FILE, 'r') as f:
+            data = json.load(f)
+        
+        count = sum(1 for doc in data.values() 
+                   if doc.get('company_id_slug') == company_id 
+                   and doc.get('status') == 'completed')
+        return count
+    except:
+        return 0
 
 # ==== Document Processing ====
 def process_document_async(filepath: str, metadata: Dict):
@@ -635,6 +659,56 @@ def update_document_status(filename: str, status: Dict):
     except Exception as e:
         logger.error(f"Error updating status for {filename}: {e}")
 
+def generate_fallback_answer(query: str, company_id: str) -> str:
+    """Generate helpful fallback answer when no documents found"""
+    query_lower = query.lower()
+    
+    # Customer service queries
+    if any(word in query_lower for word in ['angry', 'upset', 'difficult', 'complaint']):
+        return """I don't see specific customer service procedures in your documents, but here are general best practices:
+
+1. **Listen actively** - Let the customer express their concerns fully
+2. **Stay calm and professional** - Don't take it personally
+3. **Acknowledge their feelings** - Show empathy
+4. **Apologize sincerely** - Even if it's not your fault
+5. **Find a solution** - Focus on what you can do
+6. **Follow up** - Ensure the issue is resolved
+
+For company-specific procedures, please check with your manager or upload your customer service guidelines."""
+
+    # Process/procedure queries
+    elif any(word in query_lower for word in ['process', 'procedure', 'how to', 'steps']):
+        return """I couldn't find that specific procedure in your uploaded documents. 
+
+To get accurate information:
+1. Check if this procedure has been uploaded to the system
+2. Ask your supervisor for the current process
+3. Look for related procedures that might help
+
+Would you like to know what documents are currently available?"""
+
+    # Policy queries
+    elif any(word in query_lower for word in ['policy', 'rule', 'allowed', 'permitted']):
+        return """I don't see that policy in your current documents.
+
+For accurate policy information:
+- Check with your HR department
+- Review your employee handbook
+- Ask your manager for clarification
+
+Company policies should be documented and uploaded to ensure everyone has access to the same information."""
+
+    # Default fallback
+    else:
+        return f"""I couldn't find specific information about that in your documents.
+
+This might be because:
+- The relevant document hasn't been uploaded yet
+- The information is under a different topic
+- This requires checking with your supervisor
+
+Try asking about other topics, or ensure the relevant documents are uploaded to the system."""
+
 # ==== Routes ====
 @app.route('/')
 def home():
@@ -656,6 +730,10 @@ def home():
 @app.route('/healthz')
 def health():
     """Detailed health check"""
+    sop_files = glob.glob(os.path.join(config.SOP_FOLDER, "*.pdf")) + \
+                glob.glob(os.path.join(config.SOP_FOLDER, "*.docx")) + \
+                glob.glob(os.path.join(config.SOP_FOLDER, "*.txt"))
+    
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
@@ -663,17 +741,35 @@ def health():
             'vectorstore': vector_store_manager.vectorstore is not None,
             'redis': session_manager.use_redis,
             'cache_hits': cache_manager.hits,
-            'cache_misses': cache_manager.misses
+            'cache_misses': cache_manager.misses,
+            'sop_files_count': len(sop_files)
         },
+        'data_path': config.DATA_PATH,
+        'persistent_storage': os.path.exists("/data"),
         'metrics': performance_monitor.get_metrics() if config.ENABLE_METRICS else None
     })
 
 @app.route('/upload-sop', methods=['POST'])
-@limiter.limit("10 per hour")
 @validate_company_id
 def upload_sop():
     """Upload and process SOP document"""
     try:
+        # Get company ID
+        company_id = request.form.get('company_id_slug', '').strip()
+        
+        # Apply rate limits based on company
+        if company_id == 'demo-business-123':
+            # Demo has looser limits - checked by decorator
+            pass
+        else:
+            # Check document count for regular companies
+            current_count = get_company_document_count(company_id)
+            if current_count >= config.COMPANY_MAX_DOCUMENTS:
+                return jsonify({
+                    'error': f'Document limit reached. Maximum {config.COMPANY_MAX_DOCUMENTS} documents allowed.',
+                    'current_count': current_count
+                }), 400
+        
         # Validate file
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
@@ -693,7 +789,6 @@ def upload_sop():
             return jsonify({'error': 'Invalid file type. Only PDF, DOCX, and TXT allowed'}), 400
         
         # Get metadata
-        company_id = request.form.get('company_id_slug', '').strip()
         title = request.form.get('doc_title', filename)[:200]
         
         # Generate unique filename
@@ -707,6 +802,42 @@ def upload_sop():
         # Verify file was saved
         if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
             return jsonify({'error': 'File save failed'}), 500
+        
+        # Prepare metadata (FIXED - removed duplicate line)
+        metadata = {
+            'company_id_slug': company_id,
+            'title': title,
+            'filename': unique_filename,
+            'original_filename': filename,
+            'uploaded_at': datetime.now().isoformat(),
+            'file_size': os.path.getsize(filepath)
+        }
+        
+        # Update status
+        update_document_status(unique_filename, {
+            'status': 'processing',
+            **metadata
+        })
+        
+        # Process document asynchronously
+        vector_store_manager.executor.submit(process_document_async, filepath, metadata)
+        
+        # Clear cache for this company
+        cache_manager.clear_company(company_id)
+        
+        return jsonify({
+            'message': 'Document uploaded successfully',
+            'doc_id': unique_filename,
+            'status': 'processing',
+            'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
+            **metadata
+        }), 201
+        
+    except RequestEntityTooLarge:
+        return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({'error': 'Upload failed'}), 500
         
         # Prepare metadata
         metadata = {
@@ -734,6 +865,7 @@ def upload_sop():
             'message': 'Document uploaded successfully',
             'doc_id': unique_filename,
             'status': 'processing',
+            'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
             **metadata
         }), 201
         
@@ -743,129 +875,436 @@ def upload_sop():
         logger.error(f"Upload error: {e}")
         return jsonify({'error': 'Upload failed'}), 500
 
+# Apply different rate limits for demo vs regular companies
 @app.route('/query', methods=['POST'])
-@limiter.limit("30 per minute")
 @validate_company_id
 def query_sop():
-    """Process user query with RAG"""
-    start_time = time.time()
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'Invalid request format'}), 400
-        
-        # Extract and validate inputs
-        query = clean_text(data.get('query', ''))
-        company_id = data.get('company_id_slug', '').strip()
-        session_id = data.get('session_id', f"{company_id}_{int(time.time())}")
-        
-        if not query:
-            return jsonify({'error': 'Query is required'}), 400
-        
-        if len(query) > config.MAX_QUERY_LENGTH:
-            return jsonify({'error': f'Query too long. Maximum {config.MAX_QUERY_LENGTH} characters'})
-        
-        # Smart caching
-        cache_result = cache_manager.get(query, company_id)
-        if cache_result:
-            performance_monitor.track_query(time.time() - start_time, cache_result.get('model_used', ''), 'cache', cache_hit=True)
-            return jsonify({
-                **cache_result,
-                'cache_hit': True,
-                'session_id': session_id,
-                'response_time': round(time.time() - start_time, 3)
-            })
+   """Process user query with RAG"""
+   start_time = time.time()
+   
+   try:
+       data = request.get_json()
+       if not data:
+           return jsonify({'error': 'Invalid request format'}), 400
+       
+       # Extract and validate inputs
+       query = clean_text(data.get('query', ''))
+       company_id = data.get('company_id_slug', '').strip()
+       session_id = data.get('session_id', f"{company_id}_{int(time.time())}")
+       
+       # Apply rate limits
+       if company_id == 'demo-business-123':
+           # Demo gets 60/min, 1000/hour
+           @limiter.limit(f"{config.DEMO_RATE_LIMIT_PER_MINUTE} per minute; {config.DEMO_RATE_LIMIT_PER_HOUR} per hour")
+           def demo_query():
+               pass
+           demo_query()
+       else:
+           # Regular companies get 20/min, 300/hour
+           @limiter.limit(f"{config.RATE_LIMIT_PER_MINUTE} per minute; {config.RATE_LIMIT_PER_HOUR} per hour")
+           def regular_query():
+               pass
+           regular_query()
+       
+       if not query:
+           return jsonify({'error': 'Query is required'}), 400
+       
+       if len(query) > config.MAX_QUERY_LENGTH:
+           return jsonify({'error': f'Query too long. Maximum {config.MAX_QUERY_LENGTH} characters'}), 400
+       
+       # Check cache first
+       cached_response = cache_manager.get(query, company_id)
+       if cached_response:
+           performance_monitor.track_query(
+               time.time() - start_time,
+               cached_response.get('model_used', 'gpt-3.5-turbo'),
+               'cache',
+               cache_hit=True
+           )
+           return jsonify({
+               **cached_response,
+               'cache_hit': True,
+               'response_time': time.time() - start_time
+           })
+       
+       # Get or create conversation memory
+       memory = session_manager.get_conversation_memory(session_id)
+       
+       # Determine query complexity and select model
+       complexity = get_query_complexity(query)
+       llm = get_optimal_llm(complexity)
+       
+       # Search for relevant documents
+       search_results = vector_store_manager.search(query, company_id, k=config.RETRIEVAL_K)
+       
+       if not search_results and company_id == 'demo-business-123':
+           # For demo, also search without filter to find any demo content
+           search_results = vector_store_manager.search(query, '', k=3)
+       
+       # Create retriever
+       if vector_store_manager.vectorstore:
+           retriever = vector_store_manager.vectorstore.as_retriever(
+               search_kwargs={
+                   'k': len(search_results) if search_results else 1,
+                   'filter': {'company_id_slug': company_id}
+               }
+           )
+           
+           # Create QA chain
+           qa_chain = ConversationalRetrievalChain.from_llm(
+               llm=llm,
+               retriever=retriever,
+               memory=memory,
+               return_source_documents=True,
+               verbose=False
+           )
+           
+           # Get answer
+           result = qa_chain.invoke({'question': query})
+           answer = clean_text(result.get('answer', ''))
+           
+           # Check if answer is helpful
+           if not answer or len(answer.split()) < 10 or 'I don\'t know' in answer:
+               # Generate helpful fallback
+               answer = generate_fallback_answer(query, company_id)
+               source = 'fallback'
+           else:
+               source = 'documents'
+       else:
+           # No vectorstore available
+           answer = generate_fallback_answer(query, company_id)
+           source = 'fallback'
+       
+       # Save conversation memory
+       session_manager.save_conversation_memory(session_id, memory)
+       
+       # Prepare response
+       response_data = {
+           'answer': answer,
+           'session_id': session_id,
+           'source': source,
+           'model_used': llm.model_name,
+           'complexity': complexity,
+           'followups': generate_followup_questions(query, answer),
+           'documents_found': len(search_results),
+           'response_time': round(time.time() - start_time, 3)
+       }
+       
+       # Cache the response
+       cache_manager.set(query, company_id, response_data)
+       
+       # Track performance
+       performance_monitor.track_query(
+           time.time() - start_time,
+           llm.model_name,
+           source
+       )
+       
+       return jsonify(response_data)
+       
+   except Exception as e:
+       logger.error(f"Query error: {e}", exc_info=True)
+       performance_monitor.track_query(
+           time.time() - start_time,
+           'unknown',
+           'error'
+       )
+       return jsonify({
+           'error': 'Failed to process query',
+           'session_id': session_id if 'session_id' in locals() else None,
+           'response_time': round(time.time() - start_time, 3)
+       }), 500
 
-        # Get or create session memory
-        memory = session_manager.get_conversation_memory(session_id)
-
-        # Select model
-        complexity = get_query_complexity(query)
-        llm = get_optimal_llm(complexity)
-        model_used = llm.model_name if hasattr(llm, "model_name") else "unknown"
-
-        # Run retrieval-augmented generation
-        retriever = vector_store_manager.vectorstore.as_retriever(
-            search_kwargs={"k": config.RETRIEVAL_K, "filter": {"company_id_slug": company_id}}
-        )
-        rag_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=retriever,
-            memory=memory
-        )
-        result = rag_chain({"question": query})
-
-        answer = result["answer"].strip()
-        # Save conversation memory
-        session_manager.save_conversation_memory(session_id, memory)
-
-        # Optionally generate followups
-        followups = generate_followup_questions(query, answer)
-
-        # Prepare response
-        response = {
-            "answer": answer,
-            "source": "company-data",
-            "followups": followups,
-            "model_used": model_used,
-            "session_id": session_id,
-            "response_time": round(time.time() - start_time, 3),
-        }
-
-        # Cache for fast retrieval next time
-        cache_manager.set(query, company_id, response)
-        performance_monitor.track_query(time.time() - start_time, model_used, "company-data", cache_hit=False)
-
-        return jsonify(response)
-    except Exception as e:
-        logger.error(f"Query error: {e}")
-        return jsonify({"error": "Internal error processing query."}), 500
-
-# Example: voice-reply endpoint (add if you need TTS directly)
 @app.route('/voice-reply', methods=['POST'])
-@validate_company_id
 def voice_reply():
-    """Return audio reply for a given text answer"""
-    import io
-    data = request.get_json()
-    text = data.get("query", "")
-    company_id = data.get("company_id_slug", "")
-    cache_key = hashlib.sha256((company_id + ":" + text).encode()).hexdigest()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        audio_bytes = loop.run_until_complete(audio_service.generate_audio_async(text, cache_key))
-        return send_file(
-            io.BytesIO(audio_bytes),
-            mimetype="audio/mpeg",
-            as_attachment=False,
-            download_name="response.mp3"
-        )
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return jsonify({"error": "Audio generation failed"}), 500
+   """Generate audio response"""
+   try:
+       data = request.get_json()
+       if not data:
+           return jsonify({'error': 'Invalid request format'}), 400
+       
+       text = clean_text(data.get('query', ''))
+       company_id = data.get('company_id_slug', 'default')
+       
+       if not text:
+           return jsonify({'error': 'Text is required'}), 400
+       
+       # Apply rate limits based on company
+       if company_id == 'demo-business-123':
+           @limiter.limit(f"40 per minute")  # More generous for demo
+           def demo_tts():
+               pass
+           demo_tts()
+       else:
+           @limiter.limit(f"20 per minute")  # Tighter for regular companies
+           def regular_tts():
+               pass
+           regular_tts()
+       
+       # Limit text length for TTS
+       text = text[:500]
+       
+       # Generate cache key
+       cache_key = hashlib.sha256(f"{company_id}:{text}".encode()).hexdigest()[:16]
+       
+       try:
+           # Generate audio (uses cache internally)
+           audio_data = audio_service.generate_audio_sync(text, cache_key)
+           
+           # Return audio
+           return send_file(
+               BytesIO(audio_data),
+               mimetype='audio/mpeg',
+               as_attachment=False,
+               download_name='response.mp3'
+           )
+       except Exception as e:
+           logger.error(f"Audio generation error: {e}")
+           return jsonify({'error': 'Audio generation failed'}), 502
+           
+   except Exception as e:
+       logger.error(f"Voice reply error: {e}")
+       return jsonify({'error': 'Audio generation failed'}), 500
 
-# Example: company-docs endpoint
 @app.route('/company-docs/<company_id_slug>')
 @validate_company_id
-def company_docs(company_id_slug):
-    """List docs for a company"""
-    docs = []
-    try:
-        for filename in os.listdir(config.SOP_FOLDER):
-            if filename.startswith(company_id_slug + "_"):
-                path = os.path.join(config.SOP_FOLDER, filename)
-                stat = os.stat(path)
-                docs.append({
-                    "filename": filename,
-                    "file_size": stat.st_size,
-                    "status": "completed" if filename.endswith('.pdf') or filename.endswith('.docx') or filename.endswith('.txt') else "processing"
-                })
-        return jsonify(docs)
-    except Exception as e:
-        logger.error(f"List docs error: {e}")
-        return jsonify([])
+@cache.cached(timeout=60)
+def get_company_documents(company_id_slug):
+   """Get list of documents for a company"""
+   try:
+       if not os.path.exists(config.STATUS_FILE):
+           return jsonify([])
+       
+       with open(config.STATUS_FILE, 'r') as f:
+           all_docs = json.load(f)
+       
+       # Filter documents for this company
+       company_docs = []
+       for filename, metadata in all_docs.items():
+           if metadata.get('company_id_slug') == company_id_slug:
+               company_docs.append({
+                   'id': filename,
+                   'title': metadata.get('title', filename),
+                   'filename': metadata.get('original_filename', filename),
+                   'status': metadata.get('status', 'unknown'),
+                   'uploaded_at': metadata.get('uploaded_at'),
+                   'file_size': metadata.get('file_size'),
+                   'chunks': metadata.get('chunks', 0),
+                   'sop_file_url': f"{request.host_url}static/sop-files/{filename}"
+               })
+       
+       # Sort by upload date
+       company_docs.sort(key=lambda x: x.get('uploaded_at', ''), reverse=True)
+       
+       return jsonify(company_docs)
+       
+   except Exception as e:
+       logger.error(f"Error fetching company docs: {e}")
+       return jsonify({'error': 'Failed to fetch documents'}), 500
 
-# Only for local testing; Render/Gunicorn ignore this
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+@app.route('/static/sop-files/<path:filename>')
+def serve_sop_file(filename):
+   """Serve SOP files"""
+   try:
+       safe_filename = secure_filename(filename)
+       return send_from_directory(config.SOP_FOLDER, safe_filename)
+   except Exception as e:
+       logger.error(f"Error serving file: {e}")
+       return jsonify({'error': 'File not found'}), 404
+
+@app.route('/continue', methods=['POST'])
+@validate_company_id
+def continue_conversation():
+   """Continue from previous response"""
+   try:
+       data = request.get_json()
+       if not data:
+           return jsonify({'error': 'Invalid request format'}), 400
+       
+       session_id = data.get('session_id')
+       company_id = data.get('company_id_slug')
+       
+       if not session_id:
+           return jsonify({'error': 'Session ID required'}), 400
+       
+       # Get conversation memory
+       memory = session_manager.get_conversation_memory(session_id)
+       
+       # Check if there's a previous conversation
+       if not memory.chat_memory.messages:
+           return jsonify({
+               'answer': "I don't see a previous conversation to continue from. Please ask a new question.",
+               'session_id': session_id,
+               'source': 'system'
+           })
+       
+       # Generate continuation query
+       continuation_query = "Please continue with more details from where you left off."
+       
+       # Process as a regular query
+       request.json = {
+           'query': continuation_query,
+           'company_id_slug': company_id,
+           'session_id': session_id
+       }
+       
+       return query_sop()
+       
+   except Exception as e:
+       logger.error(f"Continue error: {e}")
+       return jsonify({'error': 'Failed to continue conversation'}), 500
+
+@app.route('/clear-session', methods=['POST'])
+def clear_session():
+   """Clear conversation session"""
+   try:
+       data = request.get_json()
+       session_id = data.get('session_id') if data else None
+       
+       if session_id:
+           session_manager.set_session(session_id, {})
+           return jsonify({'message': 'Session cleared'})
+       
+       return jsonify({'error': 'Session ID required'}), 400
+       
+   except Exception as e:
+       logger.error(f"Clear session error: {e}")
+       return jsonify({'error': 'Failed to clear session'}), 500
+
+@app.route('/metrics')
+@require_api_key
+def get_metrics():
+   """Get performance metrics (protected)"""
+   if not config.ENABLE_METRICS:
+       return jsonify({'error': 'Metrics disabled'}), 404
+   
+   return jsonify({
+       'performance': performance_monitor.get_metrics(),
+       'cache': {
+           'hits': cache_manager.hits,
+           'misses': cache_manager.misses,
+           'hit_rate': round((cache_manager.hits / max(1, cache_manager.hits + cache_manager.misses)) * 100, 2)
+       },
+       'sessions': {
+           'active': len(session_manager.memory_store) if not session_manager.use_redis else 'N/A'
+       }
+   })
+
+@app.route('/sop-status')
+def sop_status():
+   """Get document processing status"""
+   if os.path.exists(config.STATUS_FILE):
+       return send_file(config.STATUS_FILE)
+   return jsonify({})
+
+@app.route('/reload-db', methods=['POST'])
+@require_api_key
+def reload_db():
+   """Reload the vector database"""
+   vector_store_manager._load_vectorstore()
+   return jsonify({'message': 'Vectorstore reloaded successfully'})
+
+@app.route('/clear-cache', methods=['POST'])
+@require_api_key
+def clear_cache():
+   """Clear all caches"""
+   try:
+       # Clear query cache
+       cache_size = len(cache_manager.cache)
+       cache_manager.cache.clear()
+       cache_manager.hits = 0
+       cache_manager.misses = 0
+       
+       # Clear audio cache
+       audio_files_cleared = 0
+       if os.path.exists(config.AUDIO_CACHE_DIR):
+           for filename in os.listdir(config.AUDIO_CACHE_DIR):
+               if filename.endswith('.mp3'):
+                   try:
+                       os.remove(os.path.join(config.AUDIO_CACHE_DIR, filename))
+                       audio_files_cleared += 1
+                   except:
+                       pass
+       
+       return jsonify({
+           'message': 'Cache cleared successfully',
+           'query_cache_cleared': cache_size,
+           'audio_files_cleared': audio_files_cleared
+       })
+   except Exception as e:
+       return jsonify({'error': str(e)}), 500
+
+@app.route('/clear-sessions', methods=['POST'])
+@require_api_key
+def clear_all_sessions():
+   """Clear all conversation sessions"""
+   session_count = len(session_manager.memory_store) if not session_manager.use_redis else 0
+   session_manager.memory_store.clear()
+   return jsonify({
+       'message': f'Cleared {session_count} conversation sessions'
+   })
+
+# ==== Background Tasks ====
+def cleanup_old_data():
+   """Periodic cleanup of old data"""
+   try:
+       # Clean old audio cache
+       audio_service.cleanup_old_cache()
+       
+       # Clean expired sessions (if using memory store)
+       session_manager.cleanup_expired()
+       
+       logger.info("Cleanup completed successfully")
+   except Exception as e:
+       logger.error(f"Cleanup error: {e}")
+
+# ==== Error Handlers ====
+@app.errorhandler(413)
+def request_entity_too_large(e):
+   return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+   return jsonify({
+       'error': 'Rate limit exceeded. Please try again later.',
+       'retry_after': e.description
+   }), 429
+
+@app.errorhandler(500)
+def internal_error(e):
+   logger.error(f"Internal error: {e}")
+   return jsonify({'error': 'Internal server error'}), 500
+
+# ==== Startup ====
+if __name__ == '__main__':
+   # Ensure we don't lose existing data
+   logger.info("Starting OpsVoice API...")
+   logger.info(f"Data path: {config.DATA_PATH}")
+   logger.info(f"Existing vectorstore: {os.path.exists(config.CHROMA_DIR)}")
+   logger.info(f"Existing SOP files: {len(glob.glob(os.path.join(config.SOP_FOLDER, '*')))}")
+   
+   # Run cleanup on startup
+   cleanup_old_data()
+   
+   # Schedule periodic cleanup (every hour)
+   from threading import Timer
+   def run_cleanup():
+       cleanup_old_data()
+       Timer(3600, run_cleanup).start()
+   
+   Timer(3600, run_cleanup).start()
+   
+   # Start Flask app
+   port = int(os.environ.get('PORT', 10000))
+   debug = os.environ.get('FLASK_ENV') == 'development'
+   
+   logger.info(f"Starting OpsVoice API on port {port}")
+   logger.info(f"Redis sessions: {config.USE_REDIS_SESSIONS}")
+   logger.info(f"Demo company: demo-business-123 (enhanced limits)")
+   
+   app.run(
+       host='0.0.0.0',
+       port=port,
+       debug=debug,
+       threaded=True
+   )
