@@ -81,15 +81,15 @@ class Config:
     RETRIEVAL_K: int = 5
     EMBEDDING_BATCH_SIZE: int = 100
     
-    # Rate Limiting - Different limits for demo vs. regular companies
-    DEMO_RATE_LIMIT_PER_MINUTE: int = 60  # Looser for demo
-    DEMO_RATE_LIMIT_PER_HOUR: int = 1000   # Looser for demo
-    RATE_LIMIT_PER_MINUTE: int = 20        # Tighter for real companies
-    RATE_LIMIT_PER_HOUR: int = 300         # Tighter for real companies
+    # Rate Limiting - VERY RELAXED for demo
+    DEMO_RATE_LIMIT_PER_MINUTE: int = 200   # Very generous for demo
+    DEMO_RATE_LIMIT_PER_HOUR: int = 5000    # Very generous for demo
+    RATE_LIMIT_PER_MINUTE: int = 20         # Tighter for real companies
+    RATE_LIMIT_PER_HOUR: int = 300          # Tighter for real companies
     
     # Document Limits
-    DEMO_MAX_DOCUMENTS: int = 10           # Demo can have more docs
-    COMPANY_MAX_DOCUMENTS: int = 5         # Regular companies limited
+    DEMO_MAX_DOCUMENTS: int = 50            # Demo can have many docs
+    COMPANY_MAX_DOCUMENTS: int = 5          # Regular companies limited
     
     # Redis (optional)
     REDIS_URL: str = os.getenv("REDIS_URL")
@@ -445,18 +445,15 @@ CORS(app, resources={
     }
 })
 
-# Rate Limiting with different limits for demo
-def get_rate_limit_key():
-    """Get rate limit key based on company"""
-    company_id = request.json.get('company_id_slug', '') if request.json else ''
-    if company_id == 'demo-business-123':
-        return f"demo:{get_remote_address()}"
-    return f"{get_remote_address()}:{company_id}"
-
+# Rate Limiting
 limiter = Limiter(
     app=app,
-    key_func=get_rate_limit_key,
+    key_func=lambda: f"{get_remote_address()}:{request.json.get('company_id_slug', 'default') if request.json else 'default'}",
     storage_uri=config.REDIS_URL if config.REDIS_URL else "memory://",
+    default_limits=[
+        f"{config.RATE_LIMIT_PER_MINUTE} per minute",
+        f"{config.RATE_LIMIT_PER_HOUR} per hour"
+    ]
 )
 
 # Flask-Caching
@@ -749,6 +746,33 @@ def health():
         'metrics': performance_monitor.get_metrics() if config.ENABLE_METRICS else None
     })
 
+@app.route('/list-sops')
+def list_sops():
+    """List all uploaded SOP files"""
+    try:
+        docs = glob.glob(os.path.join(config.SOP_FOLDER, "*.docx")) + \
+               glob.glob(os.path.join(config.SOP_FOLDER, "*.pdf")) + \
+               glob.glob(os.path.join(config.SOP_FOLDER, "*.txt"))
+        
+        file_list = []
+        for doc_path in docs:
+            filename = os.path.basename(doc_path)
+            file_info = {
+                'filename': filename,
+                'size': os.path.getsize(doc_path),
+                'modified': os.path.getmtime(doc_path)
+            }
+            file_list.append(file_info)
+        
+        return jsonify({
+            'files': file_list,
+            'count': len(file_list),
+            'total_size': sum(f['size'] for f in file_list)
+        })
+    except Exception as e:
+        logger.error(f"Error listing SOPs: {e}")
+        return jsonify({'error': 'Failed to list documents'}), 500
+
 @app.route('/upload-sop', methods=['POST'])
 @validate_company_id
 def upload_sop():
@@ -757,125 +781,93 @@ def upload_sop():
         # Get company ID
         company_id = request.form.get('company_id_slug', '').strip()
         
-        # Apply rate limits based on company
+        # Check document limits based on company
         if company_id == 'demo-business-123':
-            # Demo has looser limits - checked by decorator
-            pass
-        else:
-            # Check document count for regular companies
+            # Demo has very generous limits
             current_count = get_company_document_count(company_id)
-            if current_count >= config.COMPANY_MAX_DOCUMENTS:
+            if current_count >= config.DEMO_MAX_DOCUMENTS:
                 return jsonify({
-                    'error': f'Document limit reached. Maximum {config.COMPANY_MAX_DOCUMENTS} documents allowed.',
+                    'error': f'Document limit reached. Maximum {config.DEMO_MAX_DOCUMENTS} documents allowed for demo.',
                     'current_count': current_count
                 }), 400
-        
-        # Validate file
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        file = request.files['file']
-        if not file or not file.filename:
-            return jsonify({'error': 'No file selected'}), 400
-        
-        # Secure filename
-        filename = secure_filename(file.filename)
-        if not filename:
-            return jsonify({'error': 'Invalid filename'}), 400
-        
-        # Check extension
-        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-        if ext not in ['pdf', 'docx', 'txt']:
-            return jsonify({'error': 'Invalid file type. Only PDF, DOCX, and TXT allowed'}), 400
-        
-        # Get metadata
-        title = request.form.get('doc_title', filename)[:200]
-        
-        # Generate unique filename
-        timestamp = int(time.time())
-        unique_filename = f"{company_id}_{timestamp}_{filename}"
-        filepath = os.path.join(config.SOP_FOLDER, unique_filename)
-        
-        # Save file
-        file.save(filepath)
-        
-        # Verify file was saved
-        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-            return jsonify({'error': 'File save failed'}), 500
-        
-        # Prepare metadata (FIXED - removed duplicate line)
-        metadata = {
-            'company_id_slug': company_id,
-            'title': title,
-            'filename': unique_filename,
-            'original_filename': filename,
-            'uploaded_at': datetime.now().isoformat(),
-            'file_size': os.path.getsize(filepath)
-        }
-        
-        # Update status
-        update_document_status(unique_filename, {
-            'status': 'processing',
-            **metadata
-        })
-        
-        # Process document asynchronously
-        vector_store_manager.executor.submit(process_document_async, filepath, metadata)
-        
-        # Clear cache for this company
-        cache_manager.clear_company(company_id)
-        
-        return jsonify({
-            'message': 'Document uploaded successfully',
-            'doc_id': unique_filename,
-            'status': 'processing',
-            'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
-            **metadata
-        }), 201
-        
-    except RequestEntityTooLarge:
-        return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return jsonify({'error': 'Upload failed'}), 500
-        
-        # Prepare metadata
-        metadata = {
-            'company_id_slug': company_id,
-            'title': title,
-            'filename': unique_filename,
-            'original_filename': filename,
-            'uploaded_at': datetime.now().isoformat(),
-            'file_size': os.path.getsize(filepath)
-        }
-        
-        # Update status
-        update_document_status(unique_filename, {
-            'status': 'processing',
-            **metadata
-        })
-        
-        # Process document asynchronously
-        vector_store_manager.executor.submit(process_document_async, filepath, metadata)
-        
-        # Clear cache for this company
-        cache_manager.clear_company(company_id)
-        
-        return jsonify({
-            'message': 'Document uploaded successfully',
-            'doc_id': unique_filename,
-            'status': 'processing',
-            'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
-            **metadata
-        }), 201
-        
-    except RequestEntityTooLarge:
-        return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return jsonify({'error': 'Upload failed'}), 500
+        else:
+            # Regular companies have tighter limits
+           current_count = get_company_document_count(company_id)
+           if current_count >= config.COMPANY_MAX_DOCUMENTS:
+               return jsonify({
+                   'error': f'Document limit reached. Maximum {config.COMPANY_MAX_DOCUMENTS} documents allowed.',
+                   'current_count': current_count
+               }), 400
+       
+       # Validate file
+       if 'file' not in request.files:
+           return jsonify({'error': 'No file provided'}), 400
+       
+       file = request.files['file']
+       if not file or not file.filename:
+           return jsonify({'error': 'No file selected'}), 400
+       
+       # Secure filename
+       filename = secure_filename(file.filename)
+       if not filename:
+           return jsonify({'error': 'Invalid filename'}), 400
+       
+       # Check extension
+       ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+       if ext not in ['pdf', 'docx', 'txt']:
+           return jsonify({'error': 'Invalid file type. Only PDF, DOCX, and TXT allowed'}), 400
+       
+       # Get metadata
+       title = request.form.get('doc_title', filename)[:200]
+       
+       # Generate unique filename
+       timestamp = int(time.time())
+       unique_filename = f"{company_id}_{timestamp}_{filename}"
+       filepath = os.path.join(config.SOP_FOLDER, unique_filename)
+       
+       # Save file
+       file.save(filepath)
+       
+       # Verify file was saved
+       if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+           return jsonify({'error': 'File save failed'}), 500
+       
+       # Prepare metadata
+       metadata = {
+           'company_id_slug': company_id,
+           'title': title,
+           'filename': unique_filename,
+           'original_filename': filename,
+           'uploaded_at': datetime.now().isoformat(),
+           'file_size': os.path.getsize(filepath)
+       }
+       
+       # Update status
+       update_document_status(unique_filename, {
+           'status': 'processing',
+           **metadata
+       })
+       
+       # Process document asynchronously
+       vector_store_manager.executor.submit(process_document_async, filepath, metadata)
+       
+       # Clear cache for this company
+       cache_manager.clear_company(company_id)
+       
+       return jsonify({
+           'message': 'Document uploaded successfully',
+           'doc_id': unique_filename,
+           'status': 'processing',
+           'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
+           **metadata
+       }), 201
+       
+   except RequestEntityTooLarge:
+       return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
+   except Exception as e:
+       logger.error(f"Upload error: {e}")
+       return jsonify({'error': 'Upload failed'}), 500
 
-# Apply different rate limits for demo vs regular companies
 @app.route('/query', methods=['POST'])
 @validate_company_id
 def query_sop():
@@ -891,20 +883,6 @@ def query_sop():
        query = clean_text(data.get('query', ''))
        company_id = data.get('company_id_slug', '').strip()
        session_id = data.get('session_id', f"{company_id}_{int(time.time())}")
-       
-       # Apply rate limits
-       if company_id == 'demo-business-123':
-           # Demo gets 60/min, 1000/hour
-           @limiter.limit(f"{config.DEMO_RATE_LIMIT_PER_MINUTE} per minute; {config.DEMO_RATE_LIMIT_PER_HOUR} per hour")
-           def demo_query():
-               pass
-           demo_query()
-       else:
-           # Regular companies get 20/min, 300/hour
-           @limiter.limit(f"{config.RATE_LIMIT_PER_MINUTE} per minute; {config.RATE_LIMIT_PER_HOUR} per hour")
-           def regular_query():
-               pass
-           regular_query()
        
        if not query:
            return jsonify({'error': 'Query is required'}), 400
@@ -1028,18 +1006,6 @@ def voice_reply():
        
        if not text:
            return jsonify({'error': 'Text is required'}), 400
-       
-       # Apply rate limits based on company
-       if company_id == 'demo-business-123':
-           @limiter.limit(f"40 per minute")  # More generous for demo
-           def demo_tts():
-               pass
-           demo_tts()
-       else:
-           @limiter.limit(f"20 per minute")  # Tighter for regular companies
-           def regular_tts():
-               pass
-           regular_tts()
        
        # Limit text length for TTS
        text = text[:500]
@@ -1275,6 +1241,24 @@ def internal_error(e):
    logger.error(f"Internal error: {e}")
    return jsonify({'error': 'Internal server error'}), 500
 
+# ==== Apply Rate Limits ====
+# Special rate limits for demo company
+@limiter.limit("200 per minute; 5000 per hour", 
+              key_func=lambda: "demo:all", 
+              scope=lambda: request.json and request.json.get('company_id_slug') == 'demo-business-123')
+@app.route('/query', methods=['POST'])
+def query_sop_rate_limited():
+   """Rate limited wrapper for query endpoint"""
+   pass  # The actual logic is in query_sop()
+
+@limiter.limit("100 per minute", 
+              key_func=lambda: "demo:tts", 
+              scope=lambda: request.json and request.json.get('company_id_slug') == 'demo-business-123')
+@app.route('/voice-reply', methods=['POST'])
+def voice_reply_rate_limited():
+   """Rate limited wrapper for voice endpoint"""
+   pass  # The actual logic is in voice_reply()
+
 # ==== Startup ====
 if __name__ == '__main__':
    # Ensure we don't lose existing data
@@ -1282,6 +1266,10 @@ if __name__ == '__main__':
    logger.info(f"Data path: {config.DATA_PATH}")
    logger.info(f"Existing vectorstore: {os.path.exists(config.CHROMA_DIR)}")
    logger.info(f"Existing SOP files: {len(glob.glob(os.path.join(config.SOP_FOLDER, '*')))}")
+   
+   # Log rate limits
+   logger.info(f"Demo rate limits: {config.DEMO_RATE_LIMIT_PER_MINUTE}/min, {config.DEMO_RATE_LIMIT_PER_HOUR}/hour")
+   logger.info(f"Regular rate limits: {config.RATE_LIMIT_PER_MINUTE}/min, {config.RATE_LIMIT_PER_HOUR}/hour")
    
    # Run cleanup on startup
    cleanup_old_data()
@@ -1300,7 +1288,7 @@ if __name__ == '__main__':
    
    logger.info(f"Starting OpsVoice API on port {port}")
    logger.info(f"Redis sessions: {config.USE_REDIS_SESSIONS}")
-   logger.info(f"Demo company: demo-business-123 (enhanced limits)")
+   logger.info(f"Demo company: demo-business-123 (very relaxed limits)")
    
    app.run(
        host='0.0.0.0',
