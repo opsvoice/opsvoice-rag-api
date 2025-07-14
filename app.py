@@ -50,6 +50,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_company_id_slug():
+    # Safely grab company_id_slug from both JSON and form-data POSTs
+    if request.is_json:
+        return (request.get_json(silent=True) or {}).get('company_id_slug')
+    elif request.form:
+        return request.form.get('company_id_slug')
+    return None
+
 # ==== Configuration ====
 @dataclass
 class Config:
@@ -1240,17 +1248,19 @@ def internal_error(e):
 
 # ==== Apply Rate Limits ====
 # Special rate limits for demo company
-@limiter.limit("200 per minute; 5000 per hour", 
-              key_func=lambda: "demo:all", 
-              scope=lambda: request.json and request.json.get('company_id_slug') == 'demo-business-123')
+@limiter.limit("200 per minute; 5000 per hour",
+              key_func=lambda: 'demo:all',
+              scope=lambda: get_company_id_slug() == 'demo-business-123')
+
 @app.route('/query', methods=['POST'])
 def query_sop_rate_limited():
    """Rate limited wrapper for query endpoint"""
    pass  # The actual logic is in query_sop()
 
-@limiter.limit("100 per minute", 
-              key_func=lambda: "demo:tts", 
-              scope=lambda: request.json and request.json.get('company_id_slug') == 'demo-business-123')
+@limiter.limit("100 per minute",
+              key_func=lambda: 'demo:tts',
+              scope=lambda: get_company_id_slug() == 'demo-business-123')
+
 @app.route('/voice-reply', methods=['POST'])
 def voice_reply_rate_limited():
    """Rate limited wrapper for voice endpoint"""
