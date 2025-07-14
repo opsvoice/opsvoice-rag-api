@@ -782,91 +782,88 @@ def upload_sop():
         company_id = request.form.get('company_id_slug', '').strip()
         
         # Check document limits based on company
+        current_count = get_company_document_count(company_id)
         if company_id == 'demo-business-123':
-            # Demo has very generous limits
-            current_count = get_company_document_count(company_id)
             if current_count >= config.DEMO_MAX_DOCUMENTS:
                 return jsonify({
                     'error': f'Document limit reached. Maximum {config.DEMO_MAX_DOCUMENTS} documents allowed for demo.',
                     'current_count': current_count
                 }), 400
         else:
-            # Regular companies have tighter limits
-           current_count = get_company_document_count(company_id)
-           if current_count >= config.COMPANY_MAX_DOCUMENTS:
-               return jsonify({
-                   'error': f'Document limit reached. Maximum {config.COMPANY_MAX_DOCUMENTS} documents allowed.',
-                   'current_count': current_count
-               }), 400
-       
-       # Validate file
-       if 'file' not in request.files:
-           return jsonify({'error': 'No file provided'}), 400
-       
-       file = request.files['file']
-       if not file or not file.filename:
-           return jsonify({'error': 'No file selected'}), 400
-       
-       # Secure filename
-       filename = secure_filename(file.filename)
-       if not filename:
-           return jsonify({'error': 'Invalid filename'}), 400
-       
-       # Check extension
-       ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-       if ext not in ['pdf', 'docx', 'txt']:
-           return jsonify({'error': 'Invalid file type. Only PDF, DOCX, and TXT allowed'}), 400
-       
-       # Get metadata
-       title = request.form.get('doc_title', filename)[:200]
-       
-       # Generate unique filename
-       timestamp = int(time.time())
-       unique_filename = f"{company_id}_{timestamp}_{filename}"
-       filepath = os.path.join(config.SOP_FOLDER, unique_filename)
-       
-       # Save file
-       file.save(filepath)
-       
-       # Verify file was saved
-       if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-           return jsonify({'error': 'File save failed'}), 500
-       
-       # Prepare metadata
-       metadata = {
-           'company_id_slug': company_id,
-           'title': title,
-           'filename': unique_filename,
-           'original_filename': filename,
-           'uploaded_at': datetime.now().isoformat(),
-           'file_size': os.path.getsize(filepath)
-       }
-       
-       # Update status
-       update_document_status(unique_filename, {
-           'status': 'processing',
-           **metadata
-       })
-       
-       # Process document asynchronously
-       vector_store_manager.executor.submit(process_document_async, filepath, metadata)
-       
-       # Clear cache for this company
-       cache_manager.clear_company(company_id)
-       
-       return jsonify({
-           'message': 'Document uploaded successfully',
-           'doc_id': unique_filename,
-           'status': 'processing',
-           'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
-           **metadata
-       }), 201
-       
-   except RequestEntityTooLarge:
-       return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
-   except Exception as e:
-       logger.error(f"Upload error: {e}")
-       return jsonify({'error': 'Upload failed'}), 500
+            if current_count >= config.COMPANY_MAX_DOCUMENTS:
+                return jsonify({
+                    'error': f'Document limit reached. Maximum {config.COMPANY_MAX_DOCUMENTS} documents allowed.',
+                    'current_count': current_count
+                }), 400
+        
+        # Validate file
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if not file or not file.filename:
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Secure filename
+        filename = secure_filename(file.filename)
+        if not filename:
+            return jsonify({'error': 'Invalid filename'}), 400
+        
+        # Check extension
+        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+        if ext not in ['pdf', 'docx', 'txt']:
+            return jsonify({'error': 'Invalid file type. Only PDF, DOCX, and TXT allowed'}), 400
+        
+        # Get metadata
+        title = request.form.get('doc_title', filename)[:200]
+        
+        # Generate unique filename
+        timestamp = int(time.time())
+        unique_filename = f"{company_id}_{timestamp}_{filename}"
+        filepath = os.path.join(config.SOP_FOLDER, unique_filename)
+        
+        # Save file
+        file.save(filepath)
+        
+        # Verify file was saved
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            return jsonify({'error': 'File save failed'}), 500
+        
+        # Prepare metadata
+        metadata = {
+            'company_id_slug': company_id,
+            'title': title,
+            'filename': unique_filename,
+            'original_filename': filename,
+            'uploaded_at': datetime.now().isoformat(),
+            'file_size': os.path.getsize(filepath)
+        }
+        
+        # Update status
+        update_document_status(unique_filename, {
+            'status': 'processing',
+            **metadata
+        })
+        
+        # Process document asynchronously
+        vector_store_manager.executor.submit(process_document_async, filepath, metadata)
+        
+        # Clear cache for this company
+        cache_manager.clear_company(company_id)
+        
+        return jsonify({
+            'message': 'Document uploaded successfully',
+            'doc_id': unique_filename,
+            'status': 'processing',
+            'sop_file_url': f"{request.host_url.rstrip('/')}/static/sop-files/{unique_filename}",
+            **metadata
+        }), 201
+
+    except RequestEntityTooLarge:
+        return jsonify({'error': 'File too large. Maximum size is 10MB'}), 413
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({'error': 'Upload failed'}), 500
 
 @app.route('/query', methods=['POST'])
 @validate_company_id
