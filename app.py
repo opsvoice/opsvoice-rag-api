@@ -453,6 +453,16 @@ CORS(app, resources={
     }
 })
 
+# Add this fix to your app.py right after the CORS setup
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "*")
+        response.headers.add('Access-Control-Allow-Methods', "*")
+        return response
+
 # Rate Limiting
 limiter = Limiter(
     app=app,
@@ -732,26 +742,21 @@ def home():
         'performance': performance_monitor.get_metrics() if config.ENABLE_METRICS else None
     })
 
-@app.route('/healthz')
-def health():
-    """Detailed health check"""
-    sop_files = glob.glob(os.path.join(config.SOP_FOLDER, "*.pdf")) + \
-                glob.glob(os.path.join(config.SOP_FOLDER, "*.docx")) + \
-                glob.glob(os.path.join(config.SOP_FOLDER, "*.txt"))
+@app.route("/healthz", methods=["GET", "OPTIONS"])
+def healthz():
+    if request.method == "OPTIONS":
+        return "", 204
     
     return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'services': {
-            'vectorstore': vector_store_manager.vectorstore is not None,
-            'redis': session_manager.use_redis,
-            'cache_hits': cache_manager.hits,
-            'cache_misses': cache_manager.misses,
-            'sop_files_count': len(sop_files)
-        },
-        'data_path': config.DATA_PATH,
-        'persistent_storage': os.path.exists("/data"),
-        'metrics': performance_monitor.get_metrics() if config.ENABLE_METRICS else None
+        "status": "healthy",
+        "timestamp": time.time(),
+        "vectorstore": "loaded" if vectorstore else "not_loaded",
+        "cache_size": len(query_cache),
+        "active_sessions": len(conversation_sessions),
+        "avg_response_time": performance_metrics.get("avg_response_time", 0),
+        "data_path": DATA_PATH,
+        "persistent_storage": os.path.exists("/data"),
+        "sop_files_count": len(glob.glob(os.path.join(SOP_FOLDER, "*.*")))
     })
 
 @app.route('/list-sops')
@@ -781,10 +786,12 @@ def list_sops():
         logger.error(f"Error listing SOPs: {e}")
         return jsonify({'error': 'Failed to list documents'}), 500
 
-@app.route('/upload-sop', methods=['POST'])
+@app.route('/upload-sop', methods=['POST', 'OPTIONS'])
 @validate_company_id
 def upload_sop():
     """Upload and process SOP document"""
+    if request.method == "OPTIONS":
+        return "", 204
     try:
         # Get company ID
         company_id = request.form.get('company_id_slug', '').strip()
@@ -873,12 +880,13 @@ def upload_sop():
         logger.error(f"Upload error: {e}")
         return jsonify({'error': 'Upload failed'}), 500
 
-@app.route('/query', methods=['POST'])
+@app.route('/query', methods=['POST', 'OPTIONS'])
 @validate_company_id
 def query_sop():
-   """Process user query with RAG"""
-   start_time = time.time()
-   
+    """Process user query with RAG"""
+    if request.method == "OPTIONS":
+        return "", 204
+    start_time = time.time()
    try:
        data = request.get_json()
        if not data:
