@@ -1,4 +1,4 @@
-# Python build artifacts
+# ---- Python build artifacts ----
 __pycache__/
 *.py[cod]
 *.so
@@ -7,39 +7,39 @@ __pycache__/
 dist/
 build/
 
-# Virtual environment
+# ---- Virtual environments ----
 venv/
 
-# Local environment settings
+# ---- Local environment settings ----
 .env
 
-# OS-specific files
+# ---- OS-specific ----
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Backup and temp files
+# ---- Backup and temp files ----
 *backup*.py
 *.bak
 *.tmp
 *.log
 
-# Test and demo artifacts
-test_*.py
-test_query.wav
-
-# Data directories not needed in repo
-data/
-demo_sops/
-sop-files/
-
-# Cache directories
-chroma_db/
-.cache/
-.ipynb_checkpoints/
-
-# IDE/editor settings
+# ---- IDE/editor settings ----
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# ---- Cache directories ----
+.cache/
+.ipynb_checkpoints/
+chroma_db/
+
+# ---- Test and demo artifacts (keep test_query.wav if you want?) ----
+test_*.py
+test_query.wav
+
+# ---- Old backup scripts ----
+app_backup.py
+app_backup2.py
+app_backup3.py
