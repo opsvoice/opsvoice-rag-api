@@ -37,7 +37,9 @@ session_lock = Lock()
 if os.path.exists("/data"):
     DATA_PATH = "/data"
 else:
-    DATA_PATH = os.path.join(os.getcwd(), "data")
+    # CRITICAL FIX: Always point to the data folder next to app.py
+    DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    print(f"🔧 DATA_PATH set to: {DATA_PATH}")
 
 SOP_FOLDER = os.path.join(DATA_PATH, "sop-files")
 CHROMA_DIR = os.path.join(DATA_PATH, "chroma_db")
@@ -1090,14 +1092,25 @@ def load_vectorstore_fast():
     """Fast vectorstore loading with connection pooling"""
     global vectorstore
     try:
+        logger.info(f"🔍 Checking vectorstore directory: {CHROMA_DIR}")
+        logger.info(f"🔍 Directory exists: {os.path.exists(CHROMA_DIR)}")
+        
         if os.path.exists(CHROMA_DIR):
-            vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
-            logger.info("Vectorstore loaded successfully")
+            # Check if directory has content
+            dir_contents = os.listdir(CHROMA_DIR)
+            logger.info(f"🔍 Vectorstore directory contents: {dir_contents}")
+            
+            if dir_contents:
+                vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+                logger.info("✅ Vectorstore loaded successfully")
+            else:
+                logger.warning("⚠️ Vectorstore directory is empty")
+                vectorstore = None
         else:
-            logger.warning("Vectorstore directory not found")
+            logger.warning(f"⚠️ Vectorstore directory not found: {CHROMA_DIR}")
             vectorstore = None
     except Exception as e:
-        logger.error(f"Vectorstore load error: {e}")
+        logger.error(f"❌ Vectorstore load error: {e}")
         vectorstore = None
 
 # ==== ADDITIONAL OPTIMIZED ROUTES ====
@@ -1108,26 +1121,51 @@ def company_docs(company_id_slug):
         if not company_id_slug or len(company_id_slug) < 3:
             return jsonify({"error": "Invalid company ID"}), 400
         
+        # Debug information
+        debug_info = {
+            "company_id_slug": company_id_slug,
+            "status_file_path": STATUS_FILE,
+            "status_file_exists": os.path.exists(STATUS_FILE),
+            "data_path": DATA_PATH,
+            "sop_folder": SOP_FOLDER
+        }
+        
         docs = get_company_documents_fast(company_id_slug)
+        
         return jsonify({
             "documents": docs,
             "count": len(docs),
-            "company_id": company_id_slug
+            "company_id": company_id_slug,
+            "debug": debug_info
         })
         
     except Exception as e:
         logger.error(f"Company docs error: {e}")
-        return jsonify({"error": "Failed to fetch documents"}), 500
+        return jsonify({"error": "Failed to fetch documents", "debug": str(e)}), 500
 
-@timed_lru_cache(seconds=300, maxsize=100)
 def get_company_documents_fast(company_id_slug: str) -> list:
     """Cached company document retrieval"""
+    print(f"🔍 Getting documents for company: {company_id_slug}")
+    print(f"📄 Status file path: {STATUS_FILE}")
+    print(f"📄 Status file exists: {os.path.exists(STATUS_FILE)}")
+    
+    # Also log with logger if available
+    try:
+        logger.info(f"🔍 Getting documents for company: {company_id_slug}")
+        logger.info(f"📄 Status file path: {STATUS_FILE}")
+        logger.info(f"📄 Status file exists: {os.path.exists(STATUS_FILE)}")
+    except:
+        pass
+    
     if not os.path.exists(STATUS_FILE):
+        logger.warning(f"❌ Status file not found: {STATUS_FILE}")
         return []
     
     try:
         with open(STATUS_FILE, 'r') as f:
             data = json.load(f)
+        
+        logger.info(f"📄 Loaded {len(data)} documents from status file")
         
         docs = []
         for filename, metadata in data.items():
@@ -1144,9 +1182,12 @@ def get_company_documents_fast(company_id_slug: str) -> list:
         
         # Sort by upload time (newest first)
         docs.sort(key=lambda x: x.get('uploaded_at', 0), reverse=True)
+        
+        logger.info(f"✅ Found {len(docs)} documents for company {company_id_slug}")
         return docs
         
-    except Exception:
+    except Exception as e:
+        logger.error(f"❌ Error in get_company_documents_fast: {e}")
         return []
 
 @app.route('/metrics')
@@ -1282,6 +1323,9 @@ def initialize_optimized_app():
     
     # Log system info
     logger.info(f"✅ Data path: {DATA_PATH}")
+    logger.info(f"✅ SOP folder: {SOP_FOLDER}")
+    logger.info(f"✅ Chroma directory: {CHROMA_DIR}")
+    logger.info(f"✅ Current working directory: {os.getcwd()}")
     logger.info(f"✅ Cache size: {len(query_cache)}")
     logger.info(f"✅ Precomputed responses: {len(precomputed_responses)}")
     logger.info(f"✅ Vectorstore: {'loaded' if vectorstore else 'not loaded'}")
