@@ -1,5 +1,45 @@
-chroma_db/
-.env
+# Python build artifacts
 __pycache__/
-*.pyc
-.DS_Store.
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+
+# Local environment settings
+.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup and temp files
+*backup*.py
+*.bak
+*.tmp
+*.log
+
+# Test and demo artifacts
+test_*.py
+test_query.wav
+
+# Data directories not needed in repo
+data/
+demo_sops/
+sop-files/
+
+# Cache directories
+chroma_db/
+.cache/
+.ipynb_checkpoints/
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
+*.swo

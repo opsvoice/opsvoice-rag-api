@@ -14,6 +14,8 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from datetime import datetime, timedelta
 import logging
+import tempfile
+from faster_whisper import WhisperModel
 
 load_dotenv()
 
@@ -83,10 +85,43 @@ performance_metrics = {
 embedding = OpenAIEmbeddings()
 vectorstore = None
 
+# ==== MODEL PRELOADING & CACHING ====
+# Preload LLM models globally for performance
+llm_cache = {}
+
+def preload_llms():
+    """Preload and cache LLMs for fast switching."""
+    global llm_cache
+    try:
+        llm_cache["simple"] = ChatOpenAI(
+            temperature=0,
+            model="gpt-3.5-turbo",
+            request_timeout=30,
+            max_retries=2
+        )
+        llm_cache["medium"] = ChatOpenAI(
+            temperature=0,
+            model="gpt-3.5-turbo",
+            request_timeout=30,
+            max_retries=2
+        )
+        llm_cache["complex"] = ChatOpenAI(
+            temperature=0,
+            model="gpt-4",
+            request_timeout=60,
+            max_retries=2
+        )
+        logger.info("Preloaded LLMs: gpt-3.5-turbo and gpt-4")
+    except Exception as e:
+        logger.error(f"Error preloading LLMs: {e}")
+
 # ==== FLASK APP SETUP ====
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', secrets.token_hex(32))
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+# Load Whisper model once globally
+whisper_model = WhisperModel("small.en", device="cpu")
 
 # Enhanced CORS Configuration
 ALLOWED_ORIGINS = [
@@ -331,24 +366,9 @@ def get_query_complexity(query: str) -> str:
 
 def get_optimal_llm(complexity: str) -> ChatOpenAI:
     """Select optimal LLM based on query complexity"""
-    performance_metrics["model_usage"][
-        "gpt-3.5-turbo" if complexity == "simple" else "gpt-4"
-    ] += 1
-    
-    if complexity == "simple":
-        return ChatOpenAI(
-            temperature=0, 
-            model="gpt-3.5-turbo", 
-            request_timeout=30,
-            max_retries=2
-        )
-    else:
-        return ChatOpenAI(
-            temperature=0, 
-            model="gpt-4", 
-            request_timeout=60,
-            max_retries=2
-        )
+    model_key = "complex" if complexity == "complex" else "simple"
+    performance_metrics["model_usage"][llm_cache[model_key].model_name] += 1
+    return llm_cache[model_key]
 
 def smart_truncate(text: str, max_words: int = 150) -> str:
     """Smart truncation that preserves meaning"""
@@ -403,17 +423,24 @@ def get_cached_response(query: str, company_id: str) -> dict:
     return None
 
 def cache_response(query: str, company_id: str, response: dict):
-    """Cache response with LRU eviction"""
+    """Enhanced caching with TTL and size limits"""
     cache_key = get_cache_key(query, company_id)
     
-    query_cache[cache_key] = {
-        'response': response,
-        'timestamp': time.time()
-    }
-    
-    # LRU eviction
-    while len(query_cache) > MAX_CACHE_SIZE:
-        query_cache.popitem(last=False)
+    # Only cache successful responses
+    if response.get("source") in ["sop", "business"]:
+        query_cache[cache_key] = {
+            'response': response,
+            'timestamp': time.time(),
+            'size': len(str(response))  # Track size for eviction
+        }
+        
+        # Enhanced LRU with size limits
+        total_size = sum(data.get('size', 0) for data in query_cache.values())
+        while len(query_cache) > MAX_CACHE_SIZE or total_size > 50 * 1024 * 1024:  # 50MB limit
+            oldest_key = next(iter(query_cache))
+            removed_size = query_cache[oldest_key].get('size', 0)
+            del query_cache[oldest_key]
+            total_size -= removed_size
 
 # ==== SESSION MANAGEMENT ====
 def get_session_memory(session_id: str) -> ConversationBufferMemory:
@@ -598,14 +625,17 @@ def embed_sop_worker(fpath: str, metadata: dict = None):
         })
 
 def load_vectorstore():
-    """Load the vector database"""
+    """Load the vector database with connection pooling"""
     global vectorstore
     try:
-        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
-        logger.info("Vector store loaded successfully")
+        if vectorstore is None:
+            vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+            logger.info("Vector store loaded successfully")
+        return vectorstore
     except Exception as e:
         logger.error(f"Error loading vector store: {e}")
         vectorstore = None
+        return None
 
 def ensure_vectorstore():
     """Ensure vectorstore is available and healthy"""
@@ -914,7 +944,41 @@ Try asking about procedures, policies, or customer service topics that might be 
 
 If this is a common question, consider uploading the relevant procedure to this system so everyone can access it easily."""
 
+# ==== SAFE LLM QUERY FUNCTION ====
+def safe_llm_query(llm: ChatOpenAI, query: str, retries: int = 2) -> str:
+    """Safe LLM query with fallbacks"""
+    for attempt in range(retries + 1):
+        try:
+            response = llm.invoke(query)
+            return response.content if hasattr(response, 'content') else str(response)
+        except Exception as e:
+            logger.warning(f"LLM attempt {attempt + 1} failed: {e}")
+            if attempt == retries:
+                return "I'm having trouble processing your request right now. Please try again."
+            time.sleep(0.5)  # Brief delay before retry
+
 # ==== FLASK ROUTES ====
+@app.route("/local-transcribe", methods=["POST"])
+def local_transcribe():
+    """Local Whisper transcription endpoint"""
+    audio = request.files.get("file")
+    if not audio:
+        return jsonify({"error": "No audio file provided"}), 400
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        audio.save(tmp.name)
+        temp_path = tmp.name
+
+    try:
+        segments, info = whisper_model.transcribe(temp_path)
+        transcript = " ".join([seg.text for seg in segments])
+        return jsonify({"text": transcript.strip()})
+    except Exception as e:
+        logger.error(f"Whisper transcription error: {e}")
+        return jsonify({"error": "Transcription failed", "text": ""}), 500
+    finally:
+        os.remove(temp_path)
+
 @app.route('/')
 def home():
     """Enhanced home endpoint with comprehensive system info"""
@@ -1164,46 +1228,46 @@ def query_sop():
     
     start_time = time.time()
     
+    # Early validation - fail fast
+    if not request.is_json:
+        return jsonify({"error": "Invalid request format - JSON required"}), 400
+    
+    payload = request.get_json() or {}
+    raw_query = payload.get("query", "").strip()
+    company_id = payload.get("company_id_slug", "").strip()
+    
+    if not raw_query or not company_id:
+        return jsonify({"error": "Query and company_id_slug are required"}), 400
+    
+    # Sanitize once
+    qtext = sanitize_text_input(raw_query, 500)
+    session_id = validate_session_id(payload.get("session_id", f"{company_id}_{int(time.time())}"))
+    
+    if not validate_company_id(company_id):
+        return jsonify({"error": "Invalid company identifier"}), 400
+    
+    # Rate limiting check
+    rate_ok, rate_msg = check_rate_limit(company_id, 'query')
+    if not rate_ok:
+        return jsonify({"error": rate_msg}), 429
+    
+    # Cache check first (fastest path)
+    cached_response = get_cached_response(qtext, company_id)
+    if cached_response:
+        cached_response.update({
+            "cache_hit": True,
+            "response_time": time.time() - start_time,
+            "session_id": session_id
+        })
+        update_metrics(time.time() - start_time, "cache", company_id)
+        return jsonify(cached_response)
+    
     # Ensure vectorstore is ready
     if not ensure_vectorstore():
         update_metrics(time.time() - start_time, "error")
         return jsonify({"error": "Service temporarily unavailable"}), 503
     
     try:
-        # Input validation and sanitization
-        if not request.is_json:
-            return jsonify({"error": "Invalid request format - JSON required"}), 400
-        
-        payload = request.get_json() or {}
-        
-        # Extract and validate inputs
-        raw_query = payload.get("query", "")
-        qtext = sanitize_text_input(raw_query, 500)
-        company_id = payload.get("company_id_slug", "").strip()
-        session_id = validate_session_id(payload.get("session_id", f"{company_id}_{int(time.time())}"))
-        
-        if not qtext:
-            return jsonify({"error": "Query is required"}), 400
-        
-        if not validate_company_id(company_id):
-            return jsonify({"error": "Invalid company identifier"}), 400
-        
-        # Rate limiting
-        rate_ok, rate_msg = check_rate_limit(company_id, 'query')
-        if not rate_ok:
-            return jsonify({"error": rate_msg}), 429
-        
-        # Check cache first
-        cached_response = get_cached_response(qtext, company_id)
-        if cached_response:
-            cached_response.update({
-                "cache_hit": True,
-                "response_time": time.time() - start_time,
-                "session_id": session_id
-            })
-            update_metrics(time.time() - start_time, "cache", company_id)
-            return jsonify(cached_response)
-        
         # Handle document listing queries
         doc_keywords = [
             'what documents', 'what files', 'what sops', 'uploaded documents', 
@@ -1310,10 +1374,16 @@ def query_sop():
             verbose=False
         )
         
-        # Execute query
-        result = qa.invoke({"question": expanded_query})
-        answer = clean_text(result.get("answer", ""))
-        source_docs = result.get("source_documents", [])
+        # Execute query with safe fallback
+        try:
+            result = qa.invoke({"question": expanded_query})
+            answer = clean_text(result.get("answer", ""))
+            source_docs = result.get("source_documents", [])
+        except Exception as e:
+            logger.error(f"QA chain error: {e}")
+            # Use safe LLM query as fallback
+            answer = safe_llm_query(optimal_llm, expanded_query)
+            source_docs = []
         
         # Evaluate answer quality
         if is_unhelpful_answer(answer):
@@ -1902,6 +1972,9 @@ def before_request():
 def initialize_application():
     """Initialize application on startup"""
     logger.info("Initializing OpsVoice API...")
+    
+    # Preload LLMs
+    preload_llms()
     
     # Load vectorstore
     logger.info("Loading vector store...")
