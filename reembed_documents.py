@@ -1,223 +1,184 @@
 #!/usr/bin/env python3
 """
-Re-embed existing documents with enhanced chunking
-Run this from VS Code terminal in your project directory
+Build script for Render deployment
+Embeds demo documents during build process
 """
-
-import requests
 import os
+import sys
+import json
 import time
+import shutil
 
-def reembed_demo_documents():
-    """Re-upload demo documents to trigger enhanced embedding"""
+def build_demo_documents():
+    """Embed demo documents for deployment"""
     
-    print("🔄 Re-embedding Demo Documents with Enhanced Chunking")
-    print("=" * 60)
+    print("🚀 BUILD: Embedding Demo Documents")
     
-    # Your demo documents folder
-    demo_folder = "demo_sops"
+    # Get paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    demo_sops_dir = os.path.join(script_dir, "demo_sops")
     
-    if not os.path.exists(demo_folder):
-        print(f"❌ Demo folder '{demo_folder}' not found!")
-        print("Make sure you're running this from your project root directory")
-        return False
-    
-    # List of demo documents
-    demo_files = [
-        "customer_service_procedures.pdf",
-        "daily_operations_procedures.pdf", 
-        "emergency_procedures_manual.pdf",
-        "employee_procedures_manual.pdf",
-        "onboarding_training_manual.pdf"
-    ]
-    
-    # API endpoint
-    upload_url = "https://opsvoice-rag-api.onrender.com/upload-sop"
-    
-    uploaded_count = 0
-    
-    for filename in demo_files:
-        file_path = os.path.join(demo_folder, filename)
-        
-        if not os.path.exists(file_path):
-            print(f"⚠️ Skipping {filename} - file not found")
-            continue
-        
-        print(f"\n📄 Re-uploading: {filename}")
-        
-        try:
-            # Prepare file for upload
-            with open(file_path, 'rb') as file:
-                files = {'file': (filename, file, 'application/pdf')}
-                data = {
-                    'company_id_slug': 'demo-business-123',
-                    'doc_title': filename.replace('.pdf', '').replace('_', ' ').title()
-                }
-                
-                # Upload file
-                response = requests.post(upload_url, files=files, data=data, timeout=30)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    print(f"   ✅ Upload successful: {result.get('message', 'OK')}")
-                    uploaded_count += 1
-                else:
-                    print(f"   ❌ Upload failed: {response.status_code}")
-                    print(f"      Error: {response.text[:200]}")
-        
-        except Exception as e:
-            print(f"   ❌ Error uploading {filename}: {e}")
-        
-        # Small delay to prevent rate limiting
-        time.sleep(2)
-    
-    print(f"\n📊 Upload Summary: {uploaded_count}/{len(demo_files)} files uploaded")
-    
-    if uploaded_count > 0:
-        print("\n⏳ Waiting for embedding to complete...")
-        print("This may take 30-60 seconds...")
-        
-        # Wait for embedding to complete
-        time.sleep(30)
-        
-        # Check embedding status
-        print("\n🔍 Checking embedding status...")
-        check_embedding_status()
-        
-        return True
+    # For Render deployment, use /data directory
+    if os.path.exists("/data"):
+        data_dir = "/data"
     else:
-        print("\n❌ No files were uploaded successfully")
+        data_dir = os.path.join(script_dir, "data")
+    
+    sop_files_dir = os.path.join(data_dir, "sop-files")
+    chroma_dir = os.path.join(data_dir, "chroma_db")
+    status_file = os.path.join(sop_files_dir, "status.json")
+    
+    # Create directories
+    os.makedirs(sop_files_dir, exist_ok=True)
+    os.makedirs(chroma_dir, exist_ok=True)
+    
+    # Check if demo documents exist
+    if not os.path.exists(demo_sops_dir):
+        print("❌ Demo SOPs directory not found!")
         return False
-
-def check_embedding_status():
-    """Check the status of document embedding"""
     
+    demo_files = [f for f in os.listdir(demo_sops_dir) if f.endswith(('.pdf', '.docx', '.txt'))]
+    
+    if not demo_files:
+        print("❌ No demo documents found!")
+        return False
+    
+    print(f"📄 Found {len(demo_files)} demo documents")
+    
+    # Try to import required modules
     try:
-        status_url = "https://opsvoice-rag-api.onrender.com/sop-status"
-        response = requests.get(status_url, timeout=10)
+        from langchain_community.document_loaders import PyPDFLoader
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from langchain_community.vectorstores import Chroma
+        from langchain_openai import OpenAIEmbeddings
+        from dotenv import load_dotenv
         
-        if response.status_code == 200:
-            status_data = response.json()
-            
-            if not status_data:
-                print("⚠️ No documents found in status")
-                return
-            
-            print(f"📁 Document Status:")
-            
-            embedded_count = 0
-            for filename, metadata in status_data.items():
-                status = metadata.get('status', 'unknown')
-                company = metadata.get('company_id_slug', 'unknown')
-                chunks = metadata.get('chunk_count', '?')
-                
-                if status == 'embedded':
-                    print(f"   ✅ {filename} - {chunks} chunks")
-                    embedded_count += 1
-                elif 'embedding' in status:
-                    print(f"   ⏳ {filename} - {status}")
-                else:
-                    print(f"   ❌ {filename} - {status}")
-            
-            if embedded_count > 0:
-                print(f"\n🎉 {embedded_count} documents ready with enhanced chunking!")
-                print("✅ Ready to test enhanced queries!")
-            else:
-                print("\n⚠️ Documents still processing. Wait a bit longer and check again.")
-                
-        else:
-            print(f"❌ Could not check status: {response.status_code}")
-            
-    except Exception as e:
-        print(f"❌ Error checking status: {e}")
-
-def test_enhanced_query():
-    """Test if the enhanced query processing is working"""
-    
-    print("\n🧪 Testing Enhanced Query Processing...")
-    
-    test_query = "How do I handle an angry customer?"
-    
-    try:
-        response = requests.post(
-            "https://opsvoice-rag-api.onrender.com/query",
-            json={
-                "query": test_query,
-                "company_id_slug": "demo-business-123"
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=30
+        load_dotenv()
+        
+        # Clear existing ChromaDB
+        if os.path.exists(chroma_dir):
+            shutil.rmtree(chroma_dir)
+            os.makedirs(chroma_dir, exist_ok=True)
+        
+        # Initialize embeddings and vectorstore
+        embedding = OpenAIEmbeddings()
+        vectorstore = Chroma(persist_directory=chroma_dir, embedding_function=embedding)
+        
+        # Initialize text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ". ", "? ", "! ", "; ", " "]
         )
         
-        if response.status_code == 200:
-            data = response.json()
+        # Process each demo document
+        status_data = {}
+        timestamp = int(time.time())
+        total_chunks = 0
+        
+        for i, filename in enumerate(demo_files):
+            source_path = os.path.join(demo_sops_dir, filename)
+            dest_filename = f"demo_{timestamp}_{i}_{filename}"
+            dest_path = os.path.join(sop_files_dir, dest_filename)
             
-            source = data.get('source', 'unknown')
-            fallback_used = data.get('fallback_used', False)
-            source_docs = data.get('source_documents', 0)
-            answer = data.get('answer', 'No answer')
+            print(f"📖 Processing: {filename}")
             
-            print(f"\n🔍 Test Query: '{test_query}'")
-            print(f"📊 Source: {source}")
-            print(f"📚 Documents Found: {source_docs}")
-            print(f"🔄 Fallback Used: {fallback_used}")
-            print(f"💬 Answer: {answer[:200]}...")
-            
-            if source == 'sop' and source_docs > 0 and not fallback_used:
-                print("\n🎉 SUCCESS! Enhanced processing is working!")
-                print("✅ Found relevant company documents")
-                return True
-            else:
-                print("\n⚠️ Still using fallback - may need more time for embedding")
-                return False
+            try:
+                # Copy file
+                shutil.copy2(source_path, dest_path)
                 
-        else:
-            print(f"❌ Test query failed: {response.status_code}")
-            return False
+                # Load and process document
+                if filename.endswith('.pdf'):
+                    loader = PyPDFLoader(dest_path)
+                    docs = loader.load()
+                else:
+                    continue
+                
+                # Split into chunks
+                chunks = text_splitter.split_documents(docs)
+                
+                # Add metadata to chunks
+                company_id_slug = "demo-business-123"
+                for j, chunk in enumerate(chunks):
+                    chunk.metadata.update({
+                        "company_id_slug": company_id_slug,
+                        "filename": dest_filename,
+                        "chunk_id": f"{dest_filename}_{j}",
+                        "chunk_index": j,
+                        "total_chunks": len(chunks),
+                        "source": dest_path,
+                        "uploaded_at": timestamp,
+                        "title": filename.replace('.pdf', '').replace('_', ' ').title()
+                    })
+                
+                # Add to vectorstore
+                vectorstore.add_documents(chunks)
+                vectorstore.persist()
+                
+                # Create status entry
+                status_data[dest_filename] = {
+                    "title": filename.replace('.pdf', '').replace('_', ' ').title(),
+                    "company_id_slug": company_id_slug,
+                    "filename": dest_filename,
+                    "uploaded_at": timestamp,
+                    "file_size": os.path.getsize(dest_path),
+                    "file_extension": filename.split('.')[-1].lower(),
+                    "status": "embedded",
+                    "chunk_count": len(chunks),
+                    "processing_time": 0,
+                    "updated_at": timestamp
+                }
+                
+                total_chunks += len(chunks)
+                print(f"✅ Embedded {len(chunks)} chunks from {filename}")
+                
+            except Exception as e:
+                print(f"❌ Error processing {filename}: {e}")
+                continue
+        
+        # Save status.json
+        with open(status_file, 'w') as f:
+            json.dump(status_data, f, indent=2)
+        
+        print(f"🎉 BUILD COMPLETE: {len(status_data)} documents, {total_chunks} chunks")
+        return True
+        
+    except ImportError as e:
+        print(f"⚠️ Required modules not available: {e}")
+        print("📝 Creating basic status.json...")
+        
+        # Create basic status.json without embedding
+        status_data = {}
+        timestamp = int(time.time())
+        
+        for i, filename in enumerate(demo_files):
+            dest_filename = f"demo_{timestamp}_{i}_{filename}"
+            dest_path = os.path.join(sop_files_dir, dest_filename)
             
-    except Exception as e:
-        print(f"❌ Test error: {e}")
-        return False
-
-def main():
-    """Main execution function"""
-    
-    print("🚀 OpsVoice AI Document Re-embedding Tool")
-    print("This will re-upload your demo documents with enhanced chunking")
-    print()
-    
-    # Check if we're in the right directory
-    if not os.path.exists('app.py'):
-        print("❌ app.py not found!")
-        print("Please run this script from your project root directory")
-        print("(The same directory that contains app.py)")
-        return
-    
-    # Re-embed documents
-    success = reembed_demo_documents()
-    
-    if success:
-        print("\n" + "="*60)
+            # Copy file
+            source_path = os.path.join(demo_sops_dir, filename)
+            shutil.copy2(source_path, dest_path)
+            
+            # Create status entry
+            status_data[dest_filename] = {
+                "title": filename.replace('.pdf', '').replace('_', ' ').title(),
+                "company_id_slug": "demo-business-123",
+                "filename": dest_filename,
+                "uploaded_at": timestamp,
+                "file_size": os.path.getsize(dest_path),
+                "file_extension": filename.split('.')[-1].lower(),
+                "status": "pending_embedding",
+                "chunk_count": 0,
+                "processing_time": 0,
+                "updated_at": timestamp
+            }
         
-        # Test the enhanced processing
-        test_success = test_enhanced_query()
+        # Save status.json
+        with open(status_file, 'w') as f:
+            json.dump(status_data, f, indent=2)
         
-        if test_success:
-            print("\n✅ COMPLETE SUCCESS!")
-            print("Your enhanced query processing is working!")
-            print("\n🎯 Next Steps:")
-            print("1. Run your full test script: python test_fixes.py")
-            print("2. Test with your n8n workflow")
-            print("3. Try voice queries end-to-end")
-        else:
-            print("\n⚠️ PARTIAL SUCCESS")
-            print("Documents uploaded but may still be processing")
-            print("\n🔧 Wait 1-2 minutes and run:")
-            print("python test_fixes.py")
-    else:
-        print("\n❌ FAILED")
-        print("Could not re-upload documents")
-        print("Check your internet connection and try again")
+        print(f"✅ Created basic status.json with {len(status_data)} entries")
+        return True
 
 if __name__ == "__main__":
-    main()
+    build_demo_documents()
