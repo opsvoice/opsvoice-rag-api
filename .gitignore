@@ -43,3 +43,6 @@ test_query.wav
 app_backup.py
 app_backup2.py
 app_backup3.py
+
+# Add runtime data files to your existing .gitignore
+Add-Content .gitignore "`n# ---- Runtime data files (user uploads, database) ----`ndata/`n*.sqlite3`n*.pdf`n*.docx`nstatus.json"
