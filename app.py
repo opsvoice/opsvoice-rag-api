@@ -284,6 +284,126 @@ def validate_file_upload(file) -> tuple:
     
     return True, filename
 
+# ==== ENVIRONMENT VALIDATION ====
+def validate_environment():
+    """Validate required environment variables"""
+    required_vars = {
+        'OPENAI_API_KEY': 'OpenAI API key for GPT models',
+        'ELEVENLABS_API_KEY': 'ElevenLabs API key for TTS'
+    }
+    
+    missing_vars = []
+    for var, description in required_vars.items():
+        if not os.getenv(var):
+            missing_vars.append(f"{var} ({description})")
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        return False
+    
+    logger.info("All required environment variables are configured")
+    return True
+
+# ==== DEMO DOCUMENT LOADING ====
+def load_demo_documents():
+    """Load demo documents for demo-business-123"""
+    demo_company_id = "demo-business-123"
+    demo_sops_dir = os.path.join(os.path.dirname(__file__), "demo_sops")
+    
+    if not os.path.exists(demo_sops_dir):
+        logger.warning(f"Demo SOPs directory not found: {demo_sops_dir}")
+        return False
+    
+    try:
+        # Check if demo documents are already loaded
+        existing_docs = get_company_documents_internal(demo_company_id)
+        if len(existing_docs) >= 5:
+            logger.info(f"Demo documents already loaded for {demo_company_id}: {len(existing_docs)} documents")
+            return True
+        
+        # Load demo documents
+        demo_files = [
+            "customer_service_procedures.pdf",
+            "daily_operations_procedures.pdf", 
+            "emergency_procedures_manual.pdf",
+            "employee_procedures_manual.pdf",
+            "onboarding_training_manual.pdf"
+        ]
+        
+        loaded_count = 0
+        for filename in demo_files:
+            source_path = os.path.join(demo_sops_dir, filename)
+            if not os.path.exists(source_path):
+                logger.warning(f"Demo file not found: {source_path}")
+                continue
+            
+            # Check if already processed
+            timestamp = int(time.time())
+            safe_filename = f"{demo_company_id}_{timestamp}_{filename}"
+            dest_path = os.path.join(SOP_FOLDER, safe_filename)
+            
+            # Copy file if not exists
+            if not os.path.exists(dest_path):
+                shutil.copy2(source_path, dest_path)
+                logger.info(f"Copied demo document: {filename}")
+            
+            # Prepare metadata
+            metadata = {
+                "title": filename.replace('.pdf', '').replace('_', ' ').title(),
+                "company_id_slug": demo_company_id,
+                "filename": safe_filename,
+                "original_filename": filename,
+                "uploaded_at": time.time(),
+                "file_size": os.path.getsize(dest_path),
+                "file_extension": "pdf",
+                "is_demo_document": True
+            }
+            
+            # Update status and process
+            update_status(safe_filename, {"status": "processing", **metadata})
+            Thread(target=embed_sop_worker, args=(dest_path, metadata), daemon=True).start()
+            loaded_count += 1
+        
+        logger.info(f"Loaded {loaded_count} demo documents for {demo_company_id}")
+        return loaded_count > 0
+        
+    except Exception as e:
+        logger.error(f"Error loading demo documents: {e}")
+        return False
+
+# ==== AUDIO TRANSCRIPTION ====
+def transcribe_audio(audio_data):
+    """Transcribe audio using OpenAI Whisper"""
+    try:
+        # Use OpenAI Whisper API for transcription
+        headers = {
+            "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"
+        }
+        
+        files = {
+            'file': ('audio.wav', audio_data, 'audio/wav'),
+            'model': (None, 'whisper-1'),
+            'language': (None, 'en')
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers=headers,
+            files=files,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get('text', '').strip()
+        else:
+            logger.error(f"Transcription failed: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Audio transcription error: {e}")
+        return None
+
 # ==== UTILITY FUNCTIONS ====
 def clean_text(txt: str) -> str:
     """Clean and normalize text"""
@@ -941,6 +1061,8 @@ def home():
             'query': '/query',
             'upload': '/upload-sop',
             'voice_tts': '/voice-reply',
+            'vapi_function': '/vapi-function',
+            'voice_query': '/voice-query',
             'documents': '/company-docs/{company_id}',
             'metrics': '/metrics',
             'continue': '/continue'
@@ -1383,6 +1505,309 @@ def query_sop():
         update_metrics(time.time() - start_time, "error", company_id if 'company_id' in locals() else None)
         return jsonify(response), 500
 
+# ==== VAPI FUNCTION ENDPOINT ====
+@app.route('/vapi-function', methods=['POST', 'OPTIONS'])
+def vapi_function():
+    """
+    VAPI Function Call Endpoint for Generic Business Queries
+    Accepts POST with JSON: { "functionName": ..., "args": { "query": ..., "company_id_slug": ... } }
+    Returns: { "result": ... }
+    Always returns 200 for VAPI compatibility.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+    
+    start_time = time.time()
+    try:
+        if not request.is_json:
+            logger.warning("VAPI function call: Non-JSON request received")
+            return jsonify({"result": "Invalid request: JSON required."}), 200
+
+        payload = request.get_json() or {}
+        function_name = payload.get("functionName", "")
+        args = payload.get("args", {}) or {}
+
+        logger.info(f"VAPI function call received: functionName={function_name}, args={args}")
+
+        # Extract query and company_id_slug
+        raw_query = args.get("query", "")
+        company_id = args.get("company_id_slug", "demo-business-123")
+        qtext = sanitize_text_input(raw_query, 500) if raw_query else ""
+        company_id = company_id.strip() if company_id else "demo-business-123"
+
+        if not qtext:
+            logger.info("VAPI function call: No query provided")
+            return jsonify({"result": "Please provide a query in args.query."}), 200
+
+        # Validate company ID
+        if not validate_company_id(company_id):
+            return jsonify({"result": "Invalid company identifier."}), 200
+
+        # Check if vectorstore is ready
+        if not ensure_vectorstore():
+            fallback_response = (
+                "I'm currently unable to access the business procedures database. "
+                "However, here are general business guidelines:\n\n"
+                "1. Customer Service: Always be professional and empathetic\n"
+                "2. Safety First: Follow all safety protocols and procedures\n"
+                "3. Documentation: Keep accurate records of all transactions\n"
+                "4. Communication: Clear communication is essential\n"
+                "5. Compliance: Follow all company policies and regulations\n\n"
+                "For specific procedures, please consult your supervisor or employee handbook."
+            )
+            logger.info("VAPI function call: Vectorstore not ready, returning fallback response")
+            return jsonify({"result": fallback_response}), 200
+
+        # Expand query with business terms
+        def expand_business_query(query):
+            query_lower = query.lower()
+            expansions = []
+            business_terms = {
+                "customer": ["customer", "client", "guest", "patron", "service"],
+                "employee": ["employee", "staff", "worker", "personnel", "team"],
+                "procedure": ["procedure", "process", "protocol", "steps", "workflow"],
+                "policy": ["policy", "rule", "guideline", "standard", "regulation"],
+                "safety": ["safety", "hazard", "risk", "danger", "precaution"],
+                "emergency": ["emergency", "urgent", "crisis", "evacuation", "incident"]
+            }
+            for key, terms in business_terms.items():
+                if key in query_lower:
+                    expansions.extend(terms)
+            expanded = query + " " + " ".join(expansions)
+            return expanded[:1000]
+
+        expanded_query = expand_business_query(qtext)
+
+        try:
+            # Set up retriever with company filtering
+            retriever = vectorstore.as_retriever(
+                search_kwargs={
+                    "k": 5,
+                    "filter": {"company_id_slug": company_id}
+                }
+            )
+            
+            # Create memory and LLM
+            memory = ConversationBufferMemory(
+                memory_key="chat_history",
+                return_messages=True,
+                output_key="answer"
+            )
+            llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+            
+            # Create QA chain
+            qa_chain = ConversationalRetrievalChain.from_llm(
+                llm,
+                retriever=retriever,
+                memory=memory,
+                return_source_documents=True,
+                verbose=False
+            )
+            
+            result = qa_chain.invoke({"question": expanded_query})
+            answer = clean_text(result.get("answer", ""))
+            source_docs = result.get("source_documents", [])
+
+            # Check if answer is unhelpful and provide fallback
+            if is_unhelpful_answer(answer):
+                answer = generate_business_fallback(qtext, company_id)
+
+            # Smart truncation for voice compatibility
+            if len(answer.split()) > 80:
+                answer = smart_truncate(answer, 80)
+
+            logger.info(f"VAPI function call processed in {round(time.time() - start_time, 3)}s")
+            return jsonify({"result": answer}), 200
+
+        except Exception as query_error:
+            logger.error(f"VAPI function call: Query processing error: {query_error}")
+            return jsonify({
+                "result": (
+                    "I encountered an error processing your question. "
+                    "For immediate business guidance:\n\n"
+                    "• Follow company policies and procedures\n"
+                    "• Maintain professional communication\n"
+                    "• Document important interactions\n"
+                    "• Report issues to your supervisor\n\n"
+                    "Please try again or contact your supervisor."
+                )
+            }), 200
+
+    except Exception as e:
+        logger.error(f"VAPI function call: Unexpected error: {traceback.format_exc()}")
+        return jsonify({
+            "result": "I'm experiencing technical difficulties. Please try again or contact support."
+        }), 200
+
+# ==== VOICE QUERY ENDPOINT ====
+@app.route('/voice-query', methods=['POST', 'OPTIONS'])
+def voice_query():
+    """
+    Voice Query Endpoint
+    Accepts audio or text queries and returns both text and audio response
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+    
+    start_time = time.time()
+    
+    try:
+        # Ensure vectorstore is ready
+        if not ensure_vectorstore():
+            return jsonify({"error": "Service temporarily unavailable"}), 503
+        
+        # Handle different content types
+        if request.content_type and 'multipart/form-data' in request.content_type:
+            # Audio file upload
+            audio_file = request.files.get('audio')
+            if not audio_file:
+                return jsonify({"error": "No audio file provided"}), 400
+            
+            # Validate audio file
+            if not audio_file.filename.lower().endswith(('.wav', '.mp3', '.m4a')):
+                return jsonify({"error": "Invalid audio format. Use WAV, MP3, or M4A"}), 400
+            
+            # Read audio data
+            audio_data = audio_file.read()
+            if len(audio_data) > 10 * 1024 * 1024:  # 10MB limit
+                return jsonify({"error": "Audio file too large (max 10MB)"}), 413
+            
+            # Transcribe audio
+            transcript = transcribe_audio(audio_data)
+            if not transcript:
+                return jsonify({"error": "Failed to transcribe audio"}), 400
+            
+            query_text = transcript
+            
+        elif request.is_json:
+            # Text query
+            payload = request.get_json() or {}
+            query_text = sanitize_text_input(payload.get("query", ""), 500)
+            if not query_text:
+                return jsonify({"error": "Query text required"}), 400
+        else:
+            return jsonify({"error": "Invalid content type. Use multipart/form-data for audio or JSON for text"}), 400
+        
+        # Extract and validate company ID
+        company_id = request.form.get('company_id_slug') or request.get_json().get('company_id_slug', 'demo-business-123')
+        company_id = company_id.strip() if company_id else "demo-business-123"
+        
+        if not validate_company_id(company_id):
+            return jsonify({"error": "Invalid company identifier"}), 400
+        
+        # Rate limiting
+        rate_ok, rate_msg = check_rate_limit(company_id, 'query')
+        if not rate_ok:
+            return jsonify({"error": rate_msg}), 429
+        
+        # Process query using existing logic
+        session_id = f"{company_id}_{int(time.time())}"
+        
+        # Set up retriever with company filtering
+        retriever = vectorstore.as_retriever(
+            search_kwargs={
+                "k": 7,
+                "filter": {"company_id_slug": company_id}
+            }
+        )
+        
+        # Get or create session memory
+        memory = get_session_memory(session_id)
+        
+        # Determine optimal model
+        complexity = get_query_complexity(query_text)
+        optimal_llm = get_optimal_llm(complexity)
+        
+        # Create conversational QA chain
+        qa = ConversationalRetrievalChain.from_llm(
+            optimal_llm,
+            retriever=retriever,
+            memory=memory,
+            return_source_documents=True,
+            verbose=False
+        )
+        
+        # Execute query
+        result = qa.invoke({"question": query_text})
+        answer = clean_text(result.get("answer", ""))
+        source_docs = result.get("source_documents", [])
+        
+        # Evaluate answer quality
+        if is_unhelpful_answer(answer):
+            answer = generate_business_fallback(query_text, company_id)
+            source = "business_intelligence"
+        else:
+            source = "sop"
+        
+        # Smart truncation for voice compatibility
+        if len(answer.split()) > 80:
+            answer = smart_truncate(answer, 80)
+        
+        # Generate audio response
+        audio_url = None
+        try:
+            # Generate TTS audio
+            tts_response = requests.post(
+                "https://api.elevenlabs.io/v1/text-to-speech/bIHbv24MWmeRgasZH58o/stream",
+                headers={
+                    "xi-api-key": os.getenv("ELEVENLABS_API_KEY"),
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "text": answer,
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                        "style": 0.0,
+                        "use_speaker_boost": True
+                    },
+                    "model_id": "eleven_multilingual_v2"
+                },
+                timeout=30
+            )
+            
+            if tts_response.status_code == 200:
+                # Save audio to cache
+                content_hash = hashlib.sha256(answer.encode()).hexdigest()[:16]
+                cache_key = f"{company_id}_{content_hash}.mp3"
+                cache_path = os.path.join(AUDIO_CACHE_DIR, cache_key)
+                
+                with open(cache_path, "wb") as f:
+                    f.write(tts_response.content)
+                
+                audio_url = f"{request.host_url.rstrip('/')}/static/audio/{cache_key}"
+                logger.info(f"Generated audio response: {cache_key}")
+            else:
+                logger.error(f"TTS generation failed: {tts_response.status_code}")
+                
+        except Exception as audio_error:
+            logger.error(f"Audio generation error: {audio_error}")
+        
+        # Prepare response
+        response = {
+            "query": query_text,
+            "answer": answer,
+            "audio_url": audio_url,
+            "source": source,
+            "source_documents": len(source_docs),
+            "model_used": optimal_llm.model_name,
+            "session_id": session_id,
+            "response_time": time.time() - start_time,
+            "company_id_slug": company_id
+        }
+        
+        # Update metrics
+        update_metrics(time.time() - start_time, source, company_id)
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Voice query error: {traceback.format_exc()}")
+        return jsonify({
+            "error": "Voice query processing failed",
+            "message": "Please try again or use text input"
+        }), 500
+
 @app.route('/voice-reply', methods=['POST', 'OPTIONS'])
 def voice_reply():
     """Enhanced text-to-speech with caching and optimization"""
@@ -1485,6 +1910,29 @@ def voice_reply():
     except Exception as e:
         logger.error(f"TTS error: {traceback.format_exc()}")
         return jsonify({"error": "TTS generation failed"}), 500
+
+# ==== AUDIO FILE SERVING ====
+@app.route('/static/audio/<path:filename>')
+def serve_audio(filename):
+    """Serve cached audio files"""
+    try:
+        # Security validation
+        safe_filename = secure_filename(filename)
+        if safe_filename != filename:
+            return jsonify({"error": "Invalid filename"}), 400
+        
+        file_path = os.path.join(AUDIO_CACHE_DIR, safe_filename)
+        if not os.path.exists(file_path):
+            return jsonify({"error": "Audio file not found"}), 404
+        
+        # Additional security: ensure file is within audio cache directory
+        if not os.path.abspath(file_path).startswith(os.path.abspath(AUDIO_CACHE_DIR)):
+            return jsonify({"error": "Access denied"}), 403
+        
+        return send_from_directory(AUDIO_CACHE_DIR, safe_filename, mimetype="audio/mp3")
+    except Exception as e:
+        logger.error(f"Audio serve error: {e}")
+        return jsonify({"error": "Audio serve failed"}), 500
 
 @app.route('/company-docs/<company_id_slug>')
 def company_docs(company_id_slug):
@@ -1844,6 +2292,15 @@ def bad_request(error):
         "message": "Invalid request format or parameters"
     }), 400
 
+@app.errorhandler(401)
+def unauthorized(error):
+    logger.warning(f"Unauthorized access attempt: {request.method} {request.path}")
+    logger.warning(f"Client IP: {request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR'))}")
+    return jsonify({
+        "error": "Unauthorized",
+        "message": "Authentication required or invalid credentials"
+    }), 401
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
@@ -1869,9 +2326,18 @@ def ratelimit_handler(error):
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Internal server error: {error}")
+    logger.error(f"Request details: {request.method} {request.path}")
+    logger.error(f"Request headers: {dict(request.headers)}")
+    logger.error(f"Request data: {request.get_data()[:500] if request.get_data() else 'No data'}")
+    
+    # Log stack trace for debugging
+    import traceback
+    logger.error(f"Stack trace: {traceback.format_exc()}")
+    
     return jsonify({
         "error": "Internal server error",
-        "message": "Service temporarily unavailable"
+        "message": "Service temporarily unavailable",
+        "request_id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:8]
     }), 500
 
 @app.errorhandler(503)
@@ -1890,9 +2356,19 @@ def before_request():
     global request_counter
     request_counter += 1
     
-    # Log request info for monitoring
+    # Enhanced request logging for debugging
     if request.endpoint not in ['static', 'healthz']:
-        logger.debug(f"Request {request_counter}: {request.method} {request.path}")
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR'))
+        user_agent = request.headers.get('User-Agent', 'Unknown')[:100]
+        
+        logger.info(f"Request {request_counter}: {request.method} {request.path} from {client_ip}")
+        logger.debug(f"User-Agent: {user_agent}")
+        logger.debug(f"Headers: {dict(request.headers)}")
+        
+        # Log specific VAPI requests for debugging
+        if 'vapi' in request.path.lower() or 'voice' in request.path.lower():
+            logger.info(f"VAPI/Voice request: {request.method} {request.path}")
+            logger.debug(f"Request data: {request.get_data()[:200] if request.get_data() else 'No data'}")
     
     # Periodic cleanup every 100 requests
     if request_counter % 100 == 0:
@@ -1903,12 +2379,21 @@ def initialize_application():
     """Initialize application on startup"""
     logger.info("Initializing OpsVoice API...")
     
+    # Validate environment
+    if not validate_environment():
+        logger.error("Exiting due to missing environment variables.")
+        return
+
     # Load vectorstore
     logger.info("Loading vector store...")
     load_vectorstore()
-    
+
     # Load existing metrics
     load_metrics()
+
+    # Load demo documents for demo-business-123
+    logger.info("Loading demo documents for demo-business-123...")
+    load_demo_documents()
     
     # Start periodic cleanup
     Timer(3600, periodic_cleanup).start()
